@@ -21,6 +21,7 @@ def create_trained_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
+    output_norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
@@ -33,6 +34,10 @@ def create_trained_policy(
             kwargs will be used.
         default_prompt: The default prompt to use for the policy. Will inject the prompt into the input
             data if it doesn't already exist.
+        output_norm_stats: Optional separate norm stats for the output (Unnormalize) transforms.
+            Pi0Force models have input-only norm keys (e.g. `ft_state`, `force_target`) that would
+            break `Unnormalize(strict=True)`; pass a filtered copy here while keeping the full
+            `norm_stats` for input normalization.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
@@ -63,6 +68,9 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
+    if output_norm_stats is None:
+        output_norm_stats = norm_stats
+
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:
@@ -83,7 +91,7 @@ def create_trained_policy(
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            transforms.Unnormalize(output_norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

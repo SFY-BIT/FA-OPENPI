@@ -106,6 +106,17 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Dual-head force prediction target (Pi0Force with predict_force=True and a
+    # separate force_out_proj head). Shape [*b, ah, force_dim]. None for models
+    # that do not predict force, or when force is concatenated onto `actions`
+    # (legacy single-head behaviour).
+    force_target: at.Float[ArrayT, "*b ah fd"] | None = None
+
+    # Force/torque history sequence (Pi0Force with use_ft_history=True).
+    # Flattened past T frames of force/torque, shape [*b, T*6].
+    # None when not using history sequence encoding.
+    ft_state: at.Float[ArrayT, "*b f"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +137,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            force_target=data.get("force_target"),
+            ft_state=data.get("ft_state"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -203,6 +216,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        force_target=observation.force_target,
     )
 
 

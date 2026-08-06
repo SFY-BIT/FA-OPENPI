@@ -35,12 +35,19 @@ class PiperInputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
+        # Right wrist image: use real image if available, otherwise zeros (backward compat)
+        if "observation/right_wrist_image" in data:
+            right_wrist_image = _parse_image(data["observation/right_wrist_image"])
+            has_right_wrist = True
+        else:
+            right_wrist_image = np.zeros_like(base_image)
+            has_right_wrist = False
 
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                images = (base_image, wrist_image, np.zeros_like(base_image))
-                image_masks = (np.True_, np.True_, np.False_)
+                images = (base_image, wrist_image, right_wrist_image)
+                image_masks = (np.True_, np.True_, np.True_ if has_right_wrist else np.False_)
             case _model.ModelType.PI0_FAST:
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
                 images = (base_image, np.zeros_like(base_image), wrist_image)
@@ -68,7 +75,14 @@ class PiperInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PiperOutputs(transforms.DataTransformFn):
-    """Converts model outputs back to Piper action format."""
+    """Converts model outputs back to Piper action format.
+
+    action_dim: Number of action dimensions to return from the model output.
+        Defaults to 8 (7 joints + 1 gripper) for single-arm Piper/Panda.
+        Set to 14 for dual-arm ARX X5 (7 + 7 joints, no gripper).
+    """
+
+    action_dim: int = 8
 
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, : self.action_dim])}

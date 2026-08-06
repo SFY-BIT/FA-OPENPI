@@ -55,6 +55,30 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class Pi0ForceWeightLoader(WeightLoader):
+    """Loads weights from a base pi0/pi05 checkpoint, keeping LIMoE and force params fresh.
+
+    Compatible with:
+      trained checkpoints:
+        example: "./checkpoints/<config>/<exp>/<step>/params"
+      released checkpoints:
+        example: "gs://openpi-assets/checkpoints/pi05_base/params"
+
+    Parameters matching ``missing_regex`` (lora, limoe, force, state_proj) that are NOT
+    in the loaded checkpoint will be kept from the randomly initialized reference
+    params, allowing the LIMoE/force/state_proj modules to be trained from scratch.
+    action_in_proj / action_out_proj are NOT in the regex because they keep the
+    base action_dim (32) and load pretrained weights directly.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*limoe.*|.*force.*|.*state_proj.*|.*ft_encoder.*|.*ft_proj.*")
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
@@ -88,9 +112,20 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
 
     # First, take all weights that are a subset of the reference weights.
+    # Skip any weight whose shape does not match the reference (e.g. when a
+    # dual-head model rebuilt action_out_proj from 32-dim to 7-dim); keeping
+    # the reference (randomly initialised) value preserves the correct shape.
     result = {}
     for k, v in flat_loaded.items():
         if k in flat_ref:
+            if v.shape != flat_ref[k].shape:
+                logger.info(
+                    "Skipping checkpoint weight %s: shape %s != reference %s (keeping random init)",
+                    k,
+                    v.shape,
+                    flat_ref[k].shape,
+                )
+                continue
             result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
 
     flat_loaded.clear()

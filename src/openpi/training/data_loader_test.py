@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +83,78 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+class _ToyForceDataset:
+    def __init__(self):
+        self._items = [
+            {
+                "episode_index": 0,
+                "frame_index": 0,
+                "observation.wrist_force": np.array([1, 10, 100], dtype=np.float32),
+                "observation.wrist_torque": np.array([2, 20, 200], dtype=np.float32),
+            },
+            {
+                "episode_index": 0,
+                "frame_index": 1,
+                "observation.wrist_force": np.array([3, 30, 300], dtype=np.float32),
+                "observation.wrist_torque": np.array([4, 40, 400], dtype=np.float32),
+            },
+            {
+                "episode_index": 0,
+                "frame_index": 2,
+                "observation.wrist_force": np.array([5, 50, 500], dtype=np.float32),
+                "observation.wrist_torque": np.array([6, 60, 600], dtype=np.float32),
+            },
+            {
+                "episode_index": 1,
+                "frame_index": 0,
+                "observation.wrist_force": np.array([7, 70, 700], dtype=np.float32),
+                "observation.wrist_torque": np.array([8, 80, 800], dtype=np.float32),
+            },
+        ]
+
+    def __getitem__(self, index):
+        return self._items[index]
+
+    def __len__(self):
+        return len(self._items)
+
+
+def test_force_history_augmented_dataset_zero_pads_episode_start():
+    dataset = _data_loader.ForceHistoryAugmentedDataset(_ToyForceDataset(), history_frames=3)
+
+    item = dataset[0]
+
+    np.testing.assert_allclose(
+        item["observation.wrist_force_history"],
+        np.array([[0, 0, 0], [0, 0, 0], [1, 10, 100]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        item["observation.wrist_torque_history"],
+        np.array([[0, 0, 0], [0, 0, 0], [2, 20, 200]], dtype=np.float32),
+    )
+
+
+def test_force_history_augmented_dataset_reads_previous_frames_without_cross_episode_leak():
+    dataset = _data_loader.ForceHistoryAugmentedDataset(_ToyForceDataset(), history_frames=3)
+
+    item = dataset[2]
+    np.testing.assert_allclose(
+        item["observation.wrist_force_history"],
+        np.array([[1, 10, 100], [3, 30, 300], [5, 50, 500]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        item["observation.wrist_torque_history"],
+        np.array([[2, 20, 200], [4, 40, 400], [6, 60, 600]], dtype=np.float32),
+    )
+
+    new_episode_item = dataset[3]
+    np.testing.assert_allclose(
+        new_episode_item["observation.wrist_force_history"],
+        np.array([[0, 0, 0], [0, 0, 0], [7, 70, 700]], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        new_episode_item["observation.wrist_torque_history"],
+        np.array([[0, 0, 0], [0, 0, 0], [8, 80, 800]], dtype=np.float32),
+    )

@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import io
 import logging
 import multiprocessing
 import os
@@ -8,8 +9,11 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.common.datasets.utils as _lerobot_utils
 import numpy as np
 import torch
+from PIL import Image as _PILImage
+from torchvision.transforms import functional as _torchvision_functional
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -17,6 +21,46 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+# --- monkey-patch: 让 lerobot 0.1.0 能解码 dtype=image 的 parquet 内嵌图像 ---
+# 原版 hf_transform_to_torch 只识别 PIL.Image，遇到 {'bytes':..,'path':..} dict 会
+# 走 torch.tensor(dict) 报错 "Could not infer dtype of dict"。这里在 dict 分支前
+# 插入 bytes→PIL 解码，使 image 字段被正确转成 (C,H,W) float32 tensor。
+_ORIG_HF_TRANSFORM_TO_TORCH = _lerobot_utils.hf_transform_to_torch
+
+
+def _hf_transform_to_torch_with_image_dict(items_dict):
+    """Patched version that decodes {'bytes':..,'path':..} image dicts to PIL."""
+    for key in items_dict:
+        first_item = items_dict[key][0]
+        if isinstance(first_item, _PILImage.Image):
+            to_tensor = _torchvision_functional.to_tensor
+            items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+        elif isinstance(first_item, dict) and "bytes" in first_item:
+            # lerobot v2.1 dtype=image: each item is {'bytes': <jpg/png bytes>, 'path': <filename>}
+            decoded = []
+            for it in items_dict[key]:
+                if it.get("bytes") is not None:
+                    pil_img = _PILImage.open(io.BytesIO(it["bytes"]))
+                    pil_img = pil_img.convert("RGB")
+                else:
+                    # fallback: load from path if bytes missing
+                    pil_img = _PILImage.open(it["path"]).convert("RGB")
+                decoded.append(_torchvision_functional.to_tensor(pil_img))
+            items_dict[key] = decoded
+        elif first_item is None:
+            pass
+        else:
+            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+    return items_dict
+
+
+# Apply patch once at import time.
+_lerobot_utils.hf_transform_to_torch = _hf_transform_to_torch_with_image_dict
+# Also patch the reference held by lerobot_dataset module (it imports the name).
+if hasattr(lerobot_dataset, "hf_transform_to_torch"):
+    lerobot_dataset.hf_transform_to_torch = _hf_transform_to_torch_with_image_dict
+# --- end monkey-patch ---
 
 
 class Dataset(Protocol[T_co]):
@@ -60,6 +104,97 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class ForceHistoryAugmentedDataset(Dataset[T_co]):
+    """Adds zero-padded past force/torque history to each sample.
+
+    History is ordered from oldest to newest and includes the current frame:
+    [t-K+1, ..., t-1, t]. Missing history at episode boundaries is padded with zeros.
+
+    Two modes:
+      * Legacy (force in separate wrist_force/wrist_torque fields): writes
+        ``observation.wrist_force_history`` and ``observation.wrist_torque_history``,
+        each of shape [K, D].
+      * force_in_state (force embedded inside observation.state): writes
+        ``observation.state_history`` of shape [K, state_dim], so that
+        ``ForceInStatePiperInputs`` can slice the force columns from the past K
+        state frames. Triggered when the sample contains ``observation.state``
+        but not ``observation.wrist_force``.
+    """
+
+    def __init__(self, dataset: Dataset, history_frames: int):
+        self._dataset = dataset
+        self._history_frames = history_frames
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        idx = index.__index__()
+        item = dict(self._dataset[idx])
+
+        if self._history_frames <= 0:
+            return typing.cast(T_co, item)
+
+        current_episode = int(item["episode_index"])
+        current_frame = int(item["frame_index"])
+
+        # Detect mode: if observation.state exists but wrist_force does not, the
+        # force is embedded in state (force_in_state path).
+        has_state = "observation.state" in item
+        has_wrist_force = "observation.wrist_force" in item
+
+        if has_state and not has_wrist_force:
+            # force_in_state path: collect past K state frames.
+            state_dim = int(np.asarray(item["observation.state"]).shape[-1])
+            state_history = self._collect_history(
+                idx, current_episode, current_frame, "observation.state", default_dim=state_dim
+            )
+            item["observation.state_history"] = state_history
+        else:
+            # Legacy path: separate force/torque fields.
+            force_history = self._collect_history(
+                idx, current_episode, current_frame, "observation.wrist_force", default_dim=3
+            )
+            torque_history = self._collect_history(
+                idx, current_episode, current_frame, "observation.wrist_torque", default_dim=3
+            )
+            item["observation.wrist_force_history"] = force_history
+            item["observation.wrist_torque_history"] = torque_history
+        return typing.cast(T_co, item)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _collect_history(
+        self, idx: int, current_episode: int, current_frame: int, key: str, *, default_dim: int
+    ) -> np.ndarray:
+        history: list[np.ndarray] = []
+        zero = np.zeros((default_dim,), dtype=np.float32)
+
+        for offset in range(self._history_frames - 1, -1, -1):
+            sample_idx = idx - offset
+            if sample_idx < 0:
+                history.append(zero)
+                continue
+
+            sample_item = self._dataset[sample_idx]
+            sample_episode = int(sample_item["episode_index"])
+            sample_frame = int(sample_item["frame_index"])
+            expected_frame = current_frame - offset
+            if sample_episode != current_episode or sample_frame != expected_frame:
+                history.append(zero)
+                continue
+
+            value = np.asarray(sample_item.get(key, zero), dtype=np.float32)
+            # When the key was sampled with delta_timestamps (e.g. observation.state
+            # in force_in_state mode), value is a future chunk [H, D]. The frame at
+            # offset 0 is the current frame of that historical sample — take it.
+            if value.ndim >= 2:
+                value = value.reshape(value.shape[0], -1)[0]
+            else:
+                value = value.reshape(-1)
+            history.append(value)
+
+        return np.stack(history, axis=0)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -143,10 +278,14 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend="pyav",
     )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if data_config.force_history_frames > 0:
+        dataset = ForceHistoryAugmentedDataset(dataset, data_config.force_history_frames)
 
     return dataset
 

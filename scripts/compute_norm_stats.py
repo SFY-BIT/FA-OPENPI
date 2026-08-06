@@ -102,9 +102,22 @@ def main(config_name: str, max_frames: int | None = None):
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
+    # FT history mode: also track ft_state for normalization
+    if getattr(data_config, "use_ft_history", False):
+        keys.append("ft_state")
+        stats["ft_state"] = normalize.RunningStats()
+
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+            if key in batch:
+                stats[key].update(np.asarray(batch[key]))
+        # Dual-head force prediction: also compute norm stats for the separate
+        # force_target key emitted by ForceInStatePiperInputs so that the
+        # Normalize transform can normalize force_target to match force_pred.
+        if "force_target" in batch and "force_target" not in stats:
+            stats["force_target"] = normalize.RunningStats()
+        if "force_target" in stats:
+            stats["force_target"].update(np.asarray(batch["force_target"]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

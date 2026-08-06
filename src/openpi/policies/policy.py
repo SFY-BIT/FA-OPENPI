@@ -193,10 +193,25 @@ class Policy(BasePolicy):
                 sampled_actions = jax.block_until_ready(sampled_actions)
             sample_total_ms = (time.monotonic() - sample_start) * 1000
 
-        outputs = {
-            "state": inputs["state"],
-            "actions": sampled_actions,
-        }
+        # Dual-head models (e.g. Pi0Force with force_out_proj) may return a dict
+        # {"actions": ..., "force_pred": ...} instead of a bare Actions tensor.
+        if isinstance(sampled_actions, dict):
+            outputs = {
+                "state": inputs["state"],
+                "actions": sampled_actions["actions"],
+            }
+            if "force_pred" in sampled_actions and sampled_actions["force_pred"] is not None:
+                outputs["force_pred"] = sampled_actions["force_pred"]
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": sampled_actions,
+            }
+        # Echo ft_state (input wrench history) back into the output so output-side
+        # transforms (e.g. ForceInStatePiperOutputs reading current_force from the
+        # last ft_state frame) can access the real-force history after Unnormalize.
+        if "ft_state" in inputs:
+            outputs["ft_state"] = inputs["ft_state"]
 
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

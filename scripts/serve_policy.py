@@ -113,6 +113,10 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Local directory containing norm_stats.json, used when the checkpoint's own
+    # assets (or the config's dataset path, e.g. a SLURM-only path) are unavailable.
+    norm_stats_dir: str | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -149,14 +153,82 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
     raise ValueError(f"Unsupported environment mode: {env}")
 
 
+def _load_norm_stats(checkpoint_dir: str, config_name: str,
+                     norm_stats_dir: str | None = None) -> dict | None:
+    """Load the full norm stats for a force config.
+
+    Pi0Force models normalize extra *input-only* keys (`ft_state`, `force_target`)
+    that are absent from the model output tree. `Unnormalize(strict=True)` in the
+    output pipeline fails when such keys are present, so the full stats are used
+    for input normalization and a filtered copy for output unnormalization.
+    """
+    import pathlib
+
+    from openpi.shared import normalize as _normalize
+    from openpi.training import checkpoints as _checkpoints
+
+    # 1) Explicit --norm-stats-dir (e.g. local copy of a SLURM-only dataset path).
+    if norm_stats_dir:
+        try:
+            norm_stats = _normalize.load(norm_stats_dir)
+            logging.info("Loaded norm_stats from --norm-stats-dir: %s", norm_stats_dir)
+            return norm_stats
+        except Exception:
+            logging.warning("Failed to load norm_stats from --norm-stats-dir: %s", norm_stats_dir)
+
+    cfg = _config.get_config(config_name)
+    data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
+    if data_config.asset_id is None:
+        return None
+    try:
+        norm_stats = _checkpoints.load_norm_stats(
+            pathlib.Path(checkpoint_dir) / "assets", data_config.asset_id
+        )
+    except Exception:
+        norm_stats = None
+    if norm_stats is None:
+        # Fallback: try the config assets dir (e.g. dataset root for local repos).
+        try:
+            norm_stats = data_config.norm_stats
+        except Exception:
+            norm_stats = None
+    if norm_stats is not None:
+        logging.info("Loaded norm_stats keys: %s", list(norm_stats.keys()))
+    return norm_stats
+
+
+def _filter_output_norm_stats(norm_stats: dict | None) -> dict | None:
+    """Return output-side norm stats for Unnormalize.
+
+    ft_state is an *input* key (wrench_history, 360-dim), but it IS echoed back
+    into the output data, so we keep it in the output norm_stats so that
+    Unnormalize restores it to real-force space (ForceInStatePiperOutputs reads
+    the last frame of ft_state as current_force for delta-mode force pred).
+    force_target is the training-time force target; the model emits
+    ``force_pred`` instead, so we RENAME the stats (not drop) so that
+    Unnormalize can restore force_pred to real-force space.
+    """
+    if norm_stats is None:
+        return None
+    filtered = dict(norm_stats)
+    if "force_target" in filtered:
+        filtered["force_pred"] = filtered.pop("force_target")
+    logging.info("Output norm_stats keys: %s", list(filtered.keys()))
+    return filtered
+
+
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            norm_stats = _load_norm_stats(args.policy.dir, args.policy.config,
+                                          args.norm_stats_dir)
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
+                norm_stats=norm_stats,
+                output_norm_stats=_filter_output_norm_stats(norm_stats),
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

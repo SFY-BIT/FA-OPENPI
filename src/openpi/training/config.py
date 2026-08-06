@@ -16,11 +16,13 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_force as pi0_force
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.piper_policy as piper_policy
+import openpi.policies.force_piper_policy as force_piper_policy
 import openpi.shared.download as _download
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
@@ -98,6 +100,11 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # If > 0, augment each sample with zero-padded past force/torque history.
+    force_history_frames: int = 0
+    # FT history mode: read precomputed wrench_history column instead of runtime collection.
+    use_ft_history: bool = False
+    ft_history_steps: int = 60
 
 
 class GroupFactory(Protocol):
@@ -363,38 +370,133 @@ class LeRobotPiperDataConfig(DataConfigFactory):
 
     observation_image_key: str = "observation.images.one"
     observation_wrist_image_key: str = "observation.images.two"
+    observation_right_wrist_image_key: str | None = None  # dual-arm: right wrist camera
     observation_state_key: str = "observation.state"
     action_key: str = "action"
     prompt_key: str = "prompt"
     use_delta_joint_actions: bool = True
+    use_delta_gripper_actions: bool = False  # If True, grip (dim 6) also converted to delta
+    use_force_data: bool = False  # If True, concat wrist_force + wrist_torque into state
+    predict_force: bool = False  # If True, also predict next-frame force (13-dim output)
+    # If True, force/torque is already stored inside observation.state (e.g. 13-dim
+    # state = [joints+gripper, Fx,Fy,Fz,Tx,Ty,Tz]) and ForceInStatePiperInputs is used
+    # instead of ForcePiperInputs. The dual-head model then predicts force via a
+    # separate force_out_proj head and a separate force_target key.
+    force_in_state: bool = False
+    # Force history sequence encoding (FAWAM-style).
+    # When True, ForceInStatePiperInputs reads precomputed wrench_history and
+    # emits a separate ft_state key instead of embedding force into state.
+    use_ft_history: bool = False
+    ft_history_steps: int = 60         # T: number of history frames
     state_mask_indices: tuple[int, ...] = ()
     action_mask_indices: tuple[int, ...] = ()
     state_mask_value: float = 0.0
     action_mask_value: float = 0.0
     default_prompt: str | None = None
+    # Number of action dimensions in the dataset.  Used to build the delta
+    # action mask and to configure PiperOutputs.  Default 8 = 7 joints + 1
+    # gripper (single-arm Piper/Panda).  Set to 14 for dual-arm ARX X5
+    # (7 + 7 joints, no gripper).
+    action_dim: int = 8
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/image": self.observation_image_key,
+            "observation/wrist_image": self.observation_wrist_image_key,
+            "observation/state": self.observation_state_key,
+            "actions": self.action_key,
+            "prompt": self.prompt_key,
+        }
+        # Dual-arm: add right wrist camera if configured
+        if self.observation_right_wrist_image_key is not None:
+            repack_mapping["observation/right_wrist_image"] = self.observation_right_wrist_image_key
+        # If using force data, also repack force/torque keys (dot → slash)
+        if self.use_force_data and not self.force_in_state:
+            # Force stored in separate wrist_force/wrist_torque fields.
+            repack_mapping["observation/wrist_force"] = "observation.wrist_force"
+            repack_mapping["observation/wrist_torque"] = "observation.wrist_torque"
+            # Legacy force history keys (written by ForceHistoryAugmentedDataset).
+            repack_mapping["observation/wrist_force_history"] = "observation.wrist_force_history"
+            repack_mapping["observation/wrist_torque_history"] = "observation.wrist_torque_history"
+        # If force_in_state, force lives inside observation.state already; no extra
+        # repack for the state itself. The force history (past K state frames) is
+        # written by ForceHistoryAugmentedDataset as observation.state_history and
+        # must be repack'd to observation/state_history for ForceInStatePiperInputs.
+        if self.use_force_data and self.force_in_state and not self.use_ft_history:
+            repack_mapping["observation/state_history"] = "observation.state_history"
+        # If using ft history, repack the precomputed wrench_history column.
+        if self.use_force_data and self.use_ft_history:
+            repack_mapping["observation/wrench_history"] = "observation.wrench_history"
+        # EEF pose supervision: repack the precomputed eef_delta column.
+        if getattr(model_config, 'use_eef_loss', False):
+            repack_mapping["observation/eef_delta"] = "observation.eef_delta"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": self.observation_image_key,
-                        "observation/wrist_image": self.observation_wrist_image_key,
-                        "observation/state": self.observation_state_key,
-                        "actions": self.action_key,
-                        "prompt": self.prompt_key,
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
-        data_transforms = _transforms.Group(
-            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
-            outputs=[piper_policy.PiperOutputs()],
-        )
+        if self.use_force_data and self.force_in_state:
+            # Dual-head path: force embedded in observation.state.
+            control_action_dim = getattr(model_config, 'control_action_dim', None) or getattr(model_config, 'force_start_idx', 7)
+            data_transforms = _transforms.Group(
+                inputs=[force_piper_policy.ForceInStatePiperInputs(
+                    model_type=model_config.model_type,
+                    predict_force=self.predict_force,
+                    force_history_frames=getattr(model_config, 'force_history_frames', 1),
+                    force_start_idx=getattr(model_config, 'force_start_idx', 7),
+                    force_dim=getattr(model_config, 'force_dim', 6),
+                    use_ft_history=getattr(model_config, 'use_ft_history', False),
+                    ft_history_steps=getattr(model_config, 'ft_history_steps', 60),
+                )],
+                outputs=[force_piper_policy.ForceInStatePiperOutputs(
+                    predict_force=self.predict_force,
+                    control_action_dim=control_action_dim,
+                    force_start_idx=getattr(model_config, 'force_start_idx', 7),
+                    force_dim=getattr(model_config, 'force_dim', 6),
+                    force_history_frames=getattr(model_config, 'force_history_frames', 1),
+                )],
+            )
+        elif self.use_force_data:
+            data_transforms = _transforms.Group(
+                inputs=[force_piper_policy.ForcePiperInputs(
+                    model_type=model_config.model_type,
+                    predict_force=self.predict_force,
+                    force_history_frames=getattr(model_config, 'force_history_frames', 1),
+                )],
+                outputs=[force_piper_policy.ForcePiperOutputs(
+                    predict_force=self.predict_force,
+                )],
+            )
+        else:
+            data_transforms = _transforms.Group(
+                inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
+                outputs=[piper_policy.PiperOutputs(action_dim=self.action_dim)],
+            )
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            if self.predict_force and not self.force_in_state:
+                # Legacy single-head: 14 dims = joints(7) delta, grip(1) delta, force(6) delta
+                if self.use_delta_gripper_actions:
+                    delta_action_mask = _transforms.make_bool_mask(8, 6)
+                else:
+                    delta_action_mask = _transforms.make_bool_mask(7, -1, 6)
+            elif self.predict_force and self.force_in_state:
+                # Dual-head: action target is control-only (joints+gripper, no force).
+                if self.use_delta_gripper_actions:
+                    delta_action_mask = _transforms.make_bool_mask(self.action_dim)
+                else:
+                    delta_action_mask = _transforms.make_bool_mask(self.action_dim - 1, -1)
+            elif self.use_delta_gripper_actions:
+                # all action_dim dims delta (e.g. 8 = 7 joint + 1 grip for single-arm)
+                delta_action_mask = _transforms.make_bool_mask(self.action_dim)
+            else:
+                # Single-arm default: 7 joints delta + 1 gripper absolute.
+                # Dual-arm (action_dim=14): 6 joints delta + 1 grip absolute per arm,
+                # matching the Aloha reference config make_bool_mask(6, -1, 6, -1).
+                if self.action_dim == 8:
+                    delta_action_mask = _transforms.make_bool_mask(7, -1)
+                else:
+                    delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -413,12 +515,28 @@ class LeRobotPiperDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        # Build action_sequence_keys — include force/torque if predicting force.
+        # For force_in_state (dual-head), force target comes from the future state
+        # chunk, so observation.state must be sampled with delta_timestamps too.
+        action_sequence_keys = [self.action_key]
+        if self.predict_force:
+            if self.force_in_state:
+                action_sequence_keys.append(self.observation_state_key)
+            else:
+                action_sequence_keys.extend(["observation.wrist_force", "observation.wrist_torque"])
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=(self.action_key,),
+            action_sequence_keys=tuple(action_sequence_keys),
+            force_history_frames=(
+                0 if getattr(model_config, "use_ft_history", False)
+                else (getattr(model_config, "force_history_frames", 0) if self.use_force_data else 0)
+            ),
+            use_ft_history=getattr(model_config, "use_ft_history", False),
+            ft_history_steps=getattr(model_config, "ft_history_steps", 60),
         )
 
 
@@ -554,6 +672,7 @@ class TrainConfig:
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
+    new_module_lr_multiplier: float = 1.0  # LR multiplier for limoe/force params (>1 = higher LR)
     ema_decay: float | None = 0.99
 
     # Specifies which weights should be frozen.
@@ -830,9 +949,9 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_piper_finetune",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/lerobot.act/data_piper_multi_record_cam_act_10_2",
+            repo_id="/data/group1/junjie008/siyuan-V2",
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=True,
         ),
@@ -846,8 +965,1032 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=100_000,
+    ),
+    #
+    # Two-stage: pretrain pure vision → LoRA + LIMoE + force
+    #
+    TrainConfig(
+        name="pi05_usb_pretrain",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/usb_insert_openpi_v2_F",
+            assets=AssetsConfig(asset_id="usb_pretrain_7dim"),
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="pi05_force_lora_stage2",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,  # FIX: was missing -> force loss weight stayed 0
+            force_start_idx=7,
+            force_history_frames=5, force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/usb_insert_openpi_v2_F",
+            assets=AssetsConfig(asset_id="usb_force_13dim"),
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,
+            predict_force=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("REPLACE_WITH_STAGE1_CKPT_PATH"),
+        num_train_steps=10_000,
+    ),
+    # Local LoRA + LIMoE + Force (for local rollout testing)
+    TrainConfig(
+        name="pi05_force_lora_local",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            force_start_idx=8, force_history_frames=3,
+            force_loss_weight=0.3,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/robosuite/datasets/panda-force",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,
+            predict_force=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+    ),
+    # Local LoRA + LIMoE + Force, force_loss_weight=0.1 (lower force loss weight variant)
+    TrainConfig(
+        name="pi05_force_lora_local_w01",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            force_start_idx=8, force_history_frames=3,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/robosuite/datasets/panda-force",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,
+            predict_force=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+    ),
+    # Panda full fine-tune: LIMoE + force input, no force output head, all params trainable
+    TrainConfig(
+        name="pi05_panda_full",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=False,
+            force_start_idx=8,  # Panda: 7 joints + 1 gripper
+            force_history_frames=3,
+            num_experts=4, num_top_k=1,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/panda-force-full",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,
+            predict_force=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Panda baseline: pure Pi0.5, no force input, no LIMoE, no force output
+    # For ablation comparison against pi05_panda_full
+    TrainConfig(
+        name="pi05_panda_noforce",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/panda-noforce",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=False,
+            predict_force=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Panda no-force LOCAL: same as pi05_panda_noforce but with local dataset path
+    # so that norm_stats can be loaded from local filesystem for inference
+    TrainConfig(
+        name="pi05_panda_noforce_local",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/robosuite/datasets/panda-noforce",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=False,
+            predict_force=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # RoboDojo ARX X5 dual-arm no-force LOCAL: 14-dim state/action (6+1 joints+grip
+    # per arm), 3 cameras (cam_high + cam_left_wrist + cam_right_wrist), 3 assembly
+    # tasks. Pure pose policy for the first-stage filtered self-imitation pipeline.
+    # Matches pi05_base_aloha_full_sim_arx-x5_seed_0 reference config: pi05 mode with
+    # discrete_state_input=True (auto), action_horizon=50, delta mask keeps gripper
+    # (dim 6, 13) absolute.
+    TrainConfig(
+        name="pi05_robodojo_x5_noforce_local",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/lerobot_datasets/robodojo_arx_x5_fine_assembly_v21_v21/unified_robot/robodojo_arx_x5_fine_assembly_v21",
+            observation_image_key="observation.images.cam_high",
+            observation_wrist_image_key="observation.images.cam_left_wrist",
+            observation_right_wrist_image_key="observation.images.cam_right_wrist",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,  # gripper stays absolute via delta mask
+            use_force_data=False,
+            predict_force=False,
+            action_dim=14,  # dual-arm: 7 + 7 (6 joint + 1 grip per arm)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # RoboDojo ARX X5 dual-arm no-force REMOTE: same as local but with remote
+    # dataset path for SLURM A100 full fine-tuning.
+    # Dataset: /data/group1/junjie008/datasets/robodojo_arx_x5_fine_assembly_v21
+    TrainConfig(
+        name="pi05_robodojo_x5_noforce",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/robodojo_arx_x5_fine_assembly_v21",
+            observation_image_key="observation.images.cam_high",
+            observation_wrist_image_key="observation.images.cam_left_wrist",
+            observation_right_wrist_image_key="observation.images.cam_right_wrist",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,  # gripper stays absolute via delta mask
+            use_force_data=False,
+            predict_force=False,
+            action_dim=14,  # dual-arm: 7 + 7 (6 joint + 1 grip per arm)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_usb_insert",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, discrete_state_input=False),
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/robosuite/datasets/usb_insert_openpi_v2",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    #
+    # ForceVLA / LIMoE (Sparse MoE) configs.
+    #
+    TrainConfig(
+        name="pi05_force_usb_insert",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True,  # Force/torque from wrist sensor → LIMoE
+            predict_force=True,  # FIX: was missing -> force loss weight stayed 0
+            force_start_idx=7,  # state = [joints(7), f0(3), t0(3), ..., f{K-1}(3), t{K-1}(3)]
+            force_history_frames=5,  # Past 5 frames of force as input
+            force_loss_weight=0.3,  # Force loss weighted 3x less than joints (was 0.1)
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,  # 5x LR for LIMoE + force (from scratch)
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/usb_insert_openpi_v2_F",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,  # Concat wrist_force + wrist_torque → state
+            predict_force=True,   # Also predict next-frame force (13-dim output)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_force_usb_insert_lora",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,  # FIX: was missing -> force loss weight stayed 0
+            force_start_idx=7,
+            force_history_frames=5,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/usb_insert_openpi_v2_F",
+            observation_image_key="observation.images.agent",
+            observation_wrist_image_key="observation.images.wrist",
+            default_prompt="Insert the USB into the port",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=True,
+            use_force_data=True,
+            predict_force=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=1e-5,
+            decay_steps=1_000_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # Dual-head Pi0Force for datasets where force/torque is stored INSIDE
+    # observation.state (e.g. stamp_seal_flexiv on Piper/Flexiv):
+    #   observation.state = [q1..q6, gripper, Fx,Fy,Fz,Tx,Ty,Tz]  (13-dim)
+    #   action             = [target_q1..target_q6, target_gripper] (7-dim)
+    # Uses ForceInStatePiperInputs + a separate force_out_proj head + a separate
+    # force_target key (dual-head multi-task architecture).
+    # Three-stage gradient routing:
+    #   * VLM / vision        <- action_loss only
+    #   * action expert+LIMoE <- 0.9*action_loss + 0.1*force_loss
+    #   * force_out_proj      <- force_loss only
+    #   * action_out_proj     <- action_loss only
+    TrainConfig(
+        name="pi05_force_stamp_seal",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,        # Piper control action: 6 joints + 1 gripper
+            force_start_idx=7,           # force/torque starts at state dim 7
+            force_dim=6,                 # Fx,Fy,Fz,Tx,Ty,Tz
+            force_history_frames=2,      # 2 frames of force history as input
+            # Three-stage gradient routing (scheme B+):
+            #   VLM/vision <- 1.0*action, LIMoE+expert <- 1.0*action+0.1*force,
+            #   action_out_proj <- 1.0*action, force_out_proj <- 1.0*force.
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,      # (unused in scheme B+, kept for compat)
+            force_loss_weight=0.1,       # force weight for LIMoE+expert group
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,  # gripper absolute, 6 joints delta
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,        # force lives inside observation.state
+            action_dim=7,               # control action is 7-dim (no force in action target)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # REMOTE version of pi05_force_stamp_seal for SLURM A100 training.
+    # Identical to local except dataset path points to the remote server.
+    # Dataset: /data/group1/junjie008/datasets/stamp_seal_flexiv
+    TrainConfig(
+        name="pi05_force_stamp_seal_remote",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,        # Piper control action: 6 joints + 1 gripper
+            force_start_idx=7,           # force/torque starts at state dim 7
+            force_dim=6,                 # Fx,Fy,Fz,Tx,Ty,Tz
+            force_history_frames=2,      # 2 frames of force history as input
+            # Three-stage gradient routing (scheme B+):
+            #   VLM/vision <- 1.0*action, LIMoE+expert <- 1.0*action+0.1*force,
+            #   action_out_proj <- 1.0*action, force_out_proj <- 1.0*force.
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,      # (unused in scheme B+, kept for compat)
+            force_loss_weight=0.1,       # force weight for LIMoE+expert group
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/stamp_seal_v2_flexiv",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,  # gripper absolute, 6 joints delta
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,        # force lives inside observation.state
+            action_dim=7,               # control action is 7-dim (no force in action target)
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # ── FT History 模式：时序编码器 + 全局力向量 ──
+    # 数据集需提前用 precompute_force_history.py 预处理为 _ft60 版本
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            # ── FT History 新字段 ──
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+    ),
+    # ── FT History 全参 K=16（分段编码）：本地 ──
+    # 对齐主干成熟配方：全解冻（无 freeze_filter）+ new_module_lr_multiplier=5.0
+    #   (RouterWeights 1× 基 LR；limoe 专家/force/state_proj 5×)
+    # 冷启动 pi05_base；ft_encoder(input_dim=ceil(60/16)*6=24)/ft_proj 随机初始化。
+    # 目的：判决性实验——验证「force token 形态是路由限制」，
+    #       与主干 K=2 legacy (已有 4w) 直接对比。
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_k16",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # ← K=16 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+    ),
+    # ── FT History 全参 K=16（分段编码）：远端 ──
+    # 与本地全参 K=16 唯一区别：repo_id 指向远端数据集路径。
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_k16_remote",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # ← K=16 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+    ),
+    # ── FT History 全参 K=16：本地路径版（与 _remote 唯一区别：repo_id 本地）──
+    # 用途: 本地启动 server / 离线回放, 避免远端 SLURM 路径不可达。
+    # 与 _remote 完全同构（模型/数据/超参一致），仅 repo_id 改为本地数据集路径。
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_k16_local",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # ← K=16 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+    ),
+    # ── FT History LoRA 版本：快速验证数据流 ──
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_lora",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=5_000,
+    ),
+    # ── FT History + ForceVLA-style LoRA：从 openpi-force checkpoint 热启动 ──
+    # VLM: LoRA（主干冻结，仅 LoRA 可训练）
+    # 视觉(SigLIP): 全参训练（不受 .*llm.* 冻结影响）
+    # LIMoE + force_out_proj + state_proj: 从 openpi-force ckpt 加载后继续训练
+    # ft_encoder + ft_proj: 随机初始化，10x LR
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_forcevla_lora",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 从 openpi-force 已训练的 checkpoint 热启动（含预训练 LIMoE + force_out_proj）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/mnt/hdd/sfy/openpi-force_checkpoints_bak/12000/params"
+        ),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=30_000,
+    ),
+    # ── FT History + ForceVLA-style LoRA, K=2 (多 force token) ──
+    # 与 forcevla_lora (K=1) 唯一区别：ft_num_tokens=2 → ft_proj 输出 2 个 force token。
+    # 目的：验证「force token 数量 K」对 MoE 路由的影响 ——
+    #   主干(K=2 per-frame) 能形成 force 分散/依附于主流专家；
+    #   ft60 K=1 时 force 100% 依附单一专家(E1)，router 置信度仅 0.25。
+    # 此配置对齐主干的 K=2，仅训练 LoRA/新模块，从 openpi-force 12000 热启动。
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_forcevla_lora_k2",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=2,           # ← K=2: 2 个 force token（对齐主干）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 从 openpi-force 已训练的 checkpoint 热启动（含预训练 LIMoE + force_out_proj）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/mnt/hdd/sfy/openpi-force_checkpoints_bak/12000/params"
+        ),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=30_000,
+    ),
+    # ── FT History + ForceVLA-style LoRA, K=16 (分段编码) ──
+    # 与 forcevla_lora (K=1) 唯一区别：ft_num_tokens=16 → 60 帧历史切成 16 段
+    # （每段 4 帧），每段用共享 FTEncoder 编码成独立 token，共享 ft_proj 投影。
+    # 目的：验证「force token 数量/形态是路由限制」——K=1 时 force 100% 依附
+    # 单一专家且 gate prob 仅 0.25；K=16 后 force 有 16 个语义不同的 token，
+    # 期望出现跨专家分散或独立专家趋势（对齐主干 K=2 的分散行为）。
+    TrainConfig(
+        name="pi05_force_stamp_seal_ft60_forcevla_lora_k16",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # ← K=16: 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.1,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=10.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/stamp_seal_v2_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="stamp seal",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 从 openpi-force 已训练的 checkpoint 热启动（含预训练 LIMoE + force_out_proj）；
+        # ft_encoder (input_dim=24) / ft_proj 与旧 shape 不匹配 → weight_loader 随机初始化。
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/mnt/hdd/sfy/openpi-force_checkpoints_bak/12000/params"
+        ),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=30_000,
+    ),
+    # ── Erase Board, FT History + ForceVLA-style LoRA, K=16, 弱化 force 权重 ──
+    # 背景：stamp_seal 系列后期 total_loss 几乎全部由 force loss 主导
+    # （action_loss≈0.005 vs force_loss≈0.07），怀疑训练波动/退化源于此。
+    # 本 config 将 force 权重整体调小一个量级：
+    #   * force_head_loss_weight = 0.01  (force_out_proj head 路径，原硬编码 1.0)
+    #   * force_loss_weight      = 0.01  (LIMoE+expert 路径，原 0.1)
+    #   * force_frame_spike_weight = 2.0 (帧加权，原 20.0，接触帧强调削弱一个量级)
+    # 冷启动：从 pi05_base（本地缓存）初始化，LIMoE/force/ft_encoder 随机初始化。
+    # 数据集需先用 precompute_force_history.py 生成 erase_board_flexiv_ft60。
+    TrainConfig(
+        name="pi05_force_erase_board_ft60_forcevla_lora_k16",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # K=16: 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,          # LIMoE+expert 力路径：0.1 → 0.01
+            force_head_loss_weight=0.01,     # force_out_proj head 路径：1.0 → 0.01
+            force_frame_spike_weight=2.0,    # 帧加权：20.0 → 2.0（削弱一个量级）
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/erase_board_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="erase the board",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 从 pi05_base 冷启动（本地缓存命中 gs://openpi-assets/checkpoints/pi05_base/params）；
+        # limoe/force/ft_encoder/ft_proj 不在 base 中 → weight_loader 随机初始化。
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=30_000,
+    ),
+    #
+    # Existing Piper configs.
+    #
     TrainConfig(
         name="pi05_piper_finetune_joint3mask",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),

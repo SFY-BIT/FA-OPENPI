@@ -18,6 +18,8 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.pi0_force as _pi0_force
+import openpi.models.limoe as _limoe
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -137,7 +139,10 @@ def _describe_debug_batch(raw_dataset, batch_size: int, batch_idx: int) -> str:
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
-    tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
+    tx = _optimizer.create_optimizer(
+        config.optimizer, config.lr_schedule, weight_decay_mask=None,
+        new_module_lr_multiplier=getattr(config, 'new_module_lr_multiplier', 1.0),
+    )
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -361,6 +366,8 @@ def main(config: _config.TrainConfig):
             )
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        info.update(_pi0_force._COMPONENT_LOSSES)  # from async callback, read outside jit
+        info.update(_limoe._ROUTING_METRICS)  # async routing metrics callback
         infos.append(info)
         skipped_nonfinite = float(jax.device_get(info["skipped_nonfinite"]))
         if skipped_nonfinite > 0.0 and not reported_nonfinite:
