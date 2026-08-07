@@ -36,18 +36,9 @@ logger = logging.getLogger("openpi")
 _COMPONENT_LOSSES: dict[str, float] = {}
 
 
-def _store_component_losses(
-    action_loss: float,
-    force_loss: float,
-    eef_loss: float = 0.0,
-    eef_pos_loss: float = 0.0,
-    eef_rot_loss: float = 0.0,
-):
+def _store_component_losses(action_loss: float, force_loss: float):
     _COMPONENT_LOSSES["action_loss"] = float(action_loss)
     _COMPONENT_LOSSES["force_loss"] = float(force_loss)
-    _COMPONENT_LOSSES["eef_loss"] = float(eef_loss)
-    _COMPONENT_LOSSES["eef_pos_loss"] = float(eef_pos_loss)
-    _COMPONENT_LOSSES["eef_rot_loss"] = float(eef_rot_loss)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,13 +72,8 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     # Tool extension (m): link6 → gripper(0.13503) + force sensor(0.076) = 0.211
     tool_extension: float = 0.211
     # Weight of the rotation (orientation) part of the EEF loss relative to
-    # position. Default 1.0 means rot is 1.0, but we use a separate pos weight:
-    #   eef_loss = eef_pos_weight * pos_loss + eef_angle_weight * rot_loss
+    # position. 1.0 = balanced; >1 boosts orientation (wrist) supervision.
     eef_angle_weight: float = 1.0
-    # Weight of the position part of the EEF loss. Lower than rot because the
-    # erase-board task cares mostly about orientation stability (q4-q6 yaw drift);
-    # position is anchored by the joint loss.
-    eef_pos_weight: float = 0.3
     # Quantile norm stats injected by LeRobotPiperDataConfig (physical-space
     # unnormalization before FK). Shapes [6] each (first 6 joint dims).
     eef_action_q01: np.ndarray | None = None
@@ -154,13 +140,15 @@ class Pi0Force(_Pi0):
         self.action_joint_weight = config.action_joint_weight
         self.tool_extension = config.tool_extension
         self.eef_angle_weight = config.eef_angle_weight
-        self.eef_pos_weight = config.eef_pos_weight
         # Quantile norm stats for physical-space unnormalization before FK
         # (injected by LeRobotPiperDataConfig when use_eef_loss=True).
-        self.eef_action_q01 = config.eef_action_q01
-        self.eef_action_q99 = config.eef_action_q99
-        self.eef_state_q01 = config.eef_state_q01
-        self.eef_state_q99 = config.eef_state_q99
+        # Stored as tuples: NNX flattens bare numpy/jax arrays as param leaves
+        # ("Arrays leaves are not supported"), while tuples/lists are static.
+        # compute_loss converts back with jnp.asarray(...).
+        self.eef_action_q01 = tuple(np.asarray(config.eef_action_q01, dtype=np.float32)) if config.eef_action_q01 is not None else None
+        self.eef_action_q99 = tuple(np.asarray(config.eef_action_q99, dtype=np.float32)) if config.eef_action_q99 is not None else None
+        self.eef_state_q01 = tuple(np.asarray(config.eef_state_q01, dtype=np.float32)) if config.eef_state_q01 is not None else None
+        self.eef_state_q99 = tuple(np.asarray(config.eef_state_q99, dtype=np.float32)) if config.eef_state_q99 is not None else None
         # Keep the original config.action_dim (e.g. 32) for state_proj input padding
         # and for the action head (action_in_proj / action_out_proj). The action head
         # ALWAYS operates in the full action_dim space (32), exactly like the base
@@ -524,16 +512,7 @@ class Pi0Force(_Pi0):
                     R_diff = R_pred @ jnp.swapaxes(R_gt, -1, -2) - jnp.eye(3)
                     rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
 
-                    # Weighted: orientation-dominant (erase task cares about yaw
-                    # drift of q4-q6; position is anchored by the joint loss).
-                    eef_pos = jnp.mean(pos_loss)
-                    eef_rot = jnp.mean(rot_loss)
-                    eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
-                else:
-                    # EEF enabled but norm stats not injected — zero it out.
-                    eef_loss = jnp.zeros_like(action_loss)
-                    eef_pos = jnp.zeros_like(action_loss)
-                    eef_rot = jnp.zeros_like(action_loss)
+                    eef_loss = pos_loss + self.eef_angle_weight * rot_loss
 
             # Weighted action loss: joint-space + EEF (if enabled).
             if self.use_eef_loss:
@@ -543,8 +522,6 @@ class Pi0Force(_Pi0):
             else:
                 action_loss_weighted = action_loss
                 eef_loss = jnp.zeros_like(action_loss)
-                eef_pos = jnp.zeros_like(action_loss)
-                eef_rot = jnp.zeros_like(action_loss)
 
             # Force supervised loss against the separate force_target.
             #
@@ -618,9 +595,6 @@ class Pi0Force(_Pi0):
                 _store_component_losses,
                 jnp.mean(action_loss_weighted),
                 jnp.mean(force_loss),
-                jnp.mean(eef_loss) if self.use_eef_loss else jnp.asarray(0.0),
-                eef_pos if self.use_eef_loss else jnp.asarray(0.0),
-                eef_rot if self.use_eef_loss else jnp.asarray(0.0),
             )
             return total_loss
 
