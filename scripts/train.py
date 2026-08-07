@@ -147,7 +147,16 @@ def init_train_state(
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
         # initialize the model (and its parameters).
-        model = config.model.create(model_rng)
+        # For EEF pose loss, data.create() injects quantile norm stats into
+        # model_config; we need the injected model config to build the model.
+        model_cfg = config.model
+        try:
+            _dc = config.data.create(config.assets_dirs, model_cfg)
+            if hasattr(_dc, "_eef_model_config") and _dc._eef_model_config is not None:
+                model_cfg = _dc._eef_model_config
+        except Exception:
+            pass
+        model = model_cfg.create(model_rng)
 
         # Merge the partial params into the model.
         if partial_params is not None:

@@ -112,3 +112,36 @@ def pose_from_joints(q: jax.Array, tool_extension: float = DEFAULT_TOOL_EXTENSIO
 def wrap_angle(d: jax.Array) -> jax.Array:
     """角度回绕到 [-pi, pi]。"""
     return (d + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+
+
+def jacobian(q: jax.Array, tool_extension: float = DEFAULT_TOOL_EXTENSION) -> jax.Array:
+    """EEF 雅可比矩阵 J(q): [6, 6]。
+
+    J = ∂(xyz, rpy)/∂q, 在关节位置 q 处线性化。
+    J @ delta 给出 EEF 增量 (d_xyz, d_rpy)，无角度回绕（线性小量）。
+    """
+    def _pose6(qq: jax.Array) -> jax.Array:
+        xyz, rpy = pose_from_joints(qq[None, :], tool_extension)
+        return jnp.concatenate([xyz[0], rpy[0]], axis=-1)  # [6]
+
+    return jax.jacfwd(_pose6)(q)  # [6, 6]
+
+
+def jacobian_batch(q: jax.Array, tool_extension: float = DEFAULT_TOOL_EXTENSION) -> jax.Array:
+    """批量雅可比: q[..., 6] -> J[..., 6, 6]。"""
+    return jax.vmap(lambda qq: jacobian(qq, tool_extension))(q)
+
+
+def eef_delta_from_joint_delta(
+    q_current: jax.Array,
+    joint_delta: jax.Array,
+    tool_extension: float = DEFAULT_TOOL_EXTENSION,
+) -> jax.Array:
+    """用雅可比把关节 delta 投影为 EEF delta（无绕角）。
+
+    q_current: [..., 6] 当前绝对关节角（物理空间）
+    joint_delta: [..., 6] 关节增量（物理空间）
+    返回: [..., 6] EEF 增量 = J(q_current) @ joint_delta
+    """
+    J = jacobian_batch(q_current, tool_extension)          # [..., 6, 6]
+    return jnp.einsum("...ij,...j->...i", J, joint_delta)  # [..., 6]

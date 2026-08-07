@@ -10,6 +10,7 @@ Extends the pi05-based Pi0 model with:
 import dataclasses
 import logging
 
+import numpy as np
 import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
@@ -23,6 +24,7 @@ from openpi.models import ft_encoder as _ft_encoder
 from openpi.models.pi0 import Pi0 as _Pi0
 from openpi.models.pi0 import posemb_sincos
 from openpi.models.pi0 import make_attn_mask
+from openpi.models import piper_fk_jax as _jfk
 import openpi.models.gemma as _gemma
 import openpi.models.limoe as _limoe
 from openpi.shared import array_typing as at
@@ -34,9 +36,18 @@ logger = logging.getLogger("openpi")
 _COMPONENT_LOSSES: dict[str, float] = {}
 
 
-def _store_component_losses(action_loss: float, force_loss: float):
+def _store_component_losses(
+    action_loss: float,
+    force_loss: float,
+    eef_loss: float = 0.0,
+    eef_pos_loss: float = 0.0,
+    eef_rot_loss: float = 0.0,
+):
     _COMPONENT_LOSSES["action_loss"] = float(action_loss)
     _COMPONENT_LOSSES["force_loss"] = float(force_loss)
+    _COMPONENT_LOSSES["eef_loss"] = float(eef_loss)
+    _COMPONENT_LOSSES["eef_pos_loss"] = float(eef_pos_loss)
+    _COMPONENT_LOSSES["eef_rot_loss"] = float(eef_rot_loss)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,17 +73,27 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     # vs FK of target joints) is added. This amplifies small wrist-joint errors
     # (q4-q6) that are drowned out in joint space. The model still outputs the
     # same 7-dim control action; EEF loss is computed in compute_loss via a
-    # differentiable FK. gt comes from the precomputed observation.eef_delta
-    # (normalized) in the dataset.
+    # differentiable FK. No dataset changes needed — gt is FK(target joints).
     use_eef_loss: bool = False
     # Weight of the joint-space action loss (the rest goes to EEF loss).
     # total_action = action_joint_weight * joint_loss + (1 - action_joint_weight) * eef_loss
     action_joint_weight: float = 0.7
     # Tool extension (m): link6 → gripper(0.13503) + force sensor(0.076) = 0.211
     tool_extension: float = 0.211
-    # Angle-wrap aware loss for EEF rotation part (still applied as delta in
-    # normalized space, so plain MSE works; kept for future use).
+    # Weight of the rotation (orientation) part of the EEF loss relative to
+    # position. Default 1.0 means rot is 1.0, but we use a separate pos weight:
+    #   eef_loss = eef_pos_weight * pos_loss + eef_angle_weight * rot_loss
     eef_angle_weight: float = 1.0
+    # Weight of the position part of the EEF loss. Lower than rot because the
+    # erase-board task cares mostly about orientation stability (q4-q6 yaw drift);
+    # position is anchored by the joint loss.
+    eef_pos_weight: float = 0.3
+    # Quantile norm stats injected by LeRobotPiperDataConfig (physical-space
+    # unnormalization before FK). Shapes [6] each (first 6 joint dims).
+    eef_action_q01: np.ndarray | None = None
+    eef_action_q99: np.ndarray | None = None
+    eef_state_q01: np.ndarray | None = None
+    eef_state_q99: np.ndarray | None = None
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Force":
@@ -132,6 +153,14 @@ class Pi0Force(_Pi0):
         self.use_eef_loss = config.use_eef_loss
         self.action_joint_weight = config.action_joint_weight
         self.tool_extension = config.tool_extension
+        self.eef_angle_weight = config.eef_angle_weight
+        self.eef_pos_weight = config.eef_pos_weight
+        # Quantile norm stats for physical-space unnormalization before FK
+        # (injected by LeRobotPiperDataConfig when use_eef_loss=True).
+        self.eef_action_q01 = config.eef_action_q01
+        self.eef_action_q99 = config.eef_action_q99
+        self.eef_state_q01 = config.eef_state_q01
+        self.eef_state_q99 = config.eef_state_q99
         # Keep the original config.action_dim (e.g. 32) for state_proj input padding
         # and for the action head (action_in_proj / action_out_proj). The action head
         # ALWAYS operates in the full action_dim space (32), exactly like the base
@@ -428,6 +457,95 @@ class Pi0Force(_Pi0):
             action_sq_error = jnp.square(action_pred[..., :ctrl] - u_t[..., :ctrl])
             action_loss = jnp.mean(action_sq_error, axis=-1)
 
+            # ---- EEF pose loss (dual-space supervision, optional) ----
+            # Amplify small wrist-joint errors (q4-q6) that are drowned out in
+            # joint space, by comparing the end-effector pose reached by the
+            # predicted joints vs the target joints. No dataset changes: both
+            # sides are FK'ed on the fly from physical-space joints.
+            #
+            # Pipeline per horizon step h:
+            #   pred_delta_norm  -> unnorm -> pred_delta_real     (joint delta)
+            #   target_delta     -> unnorm -> target_delta_real   (joint delta)
+            #   q_cur_norm       -> unnorm -> q_cur_real          (current joints)
+            #   pred_pose = FK(q_cur_real + pred_delta_real)      (4x4)
+            #   gt_pose   = FK(q_cur_real + target_delta_real)    (4x4)
+            #   pos_loss  = ||xyz_pred - xyz_gt||^2
+            #   rot_loss  = ||R_pred @ R_gt^T - I||^2_F  (no wrap, no gimbal)
+            eef_loss = jnp.zeros_like(action_loss)
+            if self.use_eef_loss:
+                if (
+                    self.eef_action_q01 is not None
+                    and self.eef_state_q01 is not None
+                ):
+                    # Physical-space unnormalization (quantile): real = (n+1)/2*(q99-q01)+q01.
+                    a_q01 = jnp.asarray(self.eef_action_q01)  # [6]
+                    a_q99 = jnp.asarray(self.eef_action_q99)
+                    s_q01 = jnp.asarray(self.eef_state_q01)
+                    s_q99 = jnp.asarray(self.eef_state_q99)
+
+                    # Current absolute joints: observation.state is [B, force_start_idx].
+                    # First 6 dims are the joint angles (normalized).
+                    q_cur_norm = observation.state[..., :6]                       # [B, 6]
+                    q_cur_real = (q_cur_norm + 1.0) / 2.0 * (s_q99 - s_q01) + s_q01
+
+                    # Targets: actions are [B, H, action_dim]; first 6 dims are the
+                    # normalized joint deltas (DeltaActions already applied).
+                    target_norm = actions[..., :6]                                # [B, H, 6]
+                    # Predicted velocity u_t is d(noise-actions); recover predicted
+                    # action as (noise - u_t), which for flow matching equals the
+                    # target action at training time and the predicted one otherwise.
+                    pred_norm = noise[..., :6] - action_pred[..., :6]             # [B, H, 6]
+
+                    target_real = (target_norm + 1.0) / 2.0 * (a_q99 - a_q01) + a_q01
+                    pred_real = (pred_norm + 1.0) / 2.0 * (a_q99 - a_q01) + a_q01
+
+                    # Absolute target joints per horizon step: q_cur + cumulative delta.
+                    # (DeltaActions stores delta relative to current state; each row of
+                    # the chunk is a target *absolute* joint position, so the delta for
+                    # step h is actions[h] — not cumulative.)
+                    gt_joints = q_cur_real[:, None, :] + target_real              # [B, H, 6]
+                    pred_joints = q_cur_real[:, None, :] + pred_real              # [B, H, 6]
+
+                    # FK both: [B, H, 4, 4]
+                    T_pred = _jfk.fk_batch(pred_joints.reshape(-1, 6), self.tool_extension).reshape(
+                        -1, actions.shape[-3], 4, 4
+                    )
+                    T_gt = _jfk.fk_batch(gt_joints.reshape(-1, 6), self.tool_extension).reshape(
+                        -1, actions.shape[-3], 4, 4
+                    )
+
+                    # Position loss (m).
+                    pos_diff = T_pred[..., :3, 3] - T_gt[..., :3, 3]
+                    pos_loss = jnp.mean(jnp.sum(pos_diff**2, axis=-1), axis=-1)   # [B]
+
+                    # Rotation loss: ||R_pred @ R_gt^T - I||_F^2, no wrap/gimbal.
+                    R_pred = T_pred[..., :3, :3]
+                    R_gt = T_gt[..., :3, :3]
+                    R_diff = R_pred @ jnp.swapaxes(R_gt, -1, -2) - jnp.eye(3)
+                    rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
+
+                    # Weighted: orientation-dominant (erase task cares about yaw
+                    # drift of q4-q6; position is anchored by the joint loss).
+                    eef_pos = jnp.mean(pos_loss)
+                    eef_rot = jnp.mean(rot_loss)
+                    eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
+                else:
+                    # EEF enabled but norm stats not injected — zero it out.
+                    eef_loss = jnp.zeros_like(action_loss)
+                    eef_pos = jnp.zeros_like(action_loss)
+                    eef_rot = jnp.zeros_like(action_loss)
+
+            # Weighted action loss: joint-space + EEF (if enabled).
+            if self.use_eef_loss:
+                joint_part = self.action_joint_weight * action_loss
+                eef_part = (1.0 - self.action_joint_weight) * eef_loss
+                action_loss_weighted = joint_part + eef_part
+            else:
+                action_loss_weighted = action_loss
+                eef_loss = jnp.zeros_like(action_loss)
+                eef_pos = jnp.zeros_like(action_loss)
+                eef_rot = jnp.zeros_like(action_loss)
+
             # Force supervised loss against the separate force_target.
             #
             # IMPORTANT: delta force has a long-tailed distribution — most frames
@@ -488,18 +606,21 @@ class Pi0Force(_Pi0):
             # erase_board config sets both to 0.01 + frame spike 2.0.
             if self.grad_route_mode == "three_stage":
                 total_loss = (
-                    action_loss
+                    action_loss_weighted
                     + self.force_head_loss_weight * force_loss_head
                     + self.force_loss_weight * force_loss_expert
                 )
             else:
-                total_loss = action_loss + self.force_loss_weight * force_loss_head
+                total_loss = action_loss_weighted + self.force_loss_weight * force_loss_head
 
             # Async component losses for wandb (zero training overhead).
             jax.debug.callback(
                 _store_component_losses,
-                jnp.mean(action_loss),
+                jnp.mean(action_loss_weighted),
                 jnp.mean(force_loss),
+                jnp.mean(eef_loss) if self.use_eef_loss else jnp.asarray(0.0),
+                eef_pos if self.use_eef_loss else jnp.asarray(0.0),
+                eef_rot if self.use_eef_loss else jnp.asarray(0.0),
             )
             return total_loss
 

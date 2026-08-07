@@ -8,6 +8,7 @@ import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
+import numpy as np
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -102,6 +103,11 @@ class DataConfig:
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
     # If > 0, augment each sample with zero-padded past force/torque history.
     force_history_frames: int = 0
+
+    # Internal: the model config after EEF norm-stats injection (set by
+    # LeRobotPiperDataConfig.create when use_eef_loss=True). train.py reads
+    # this to build the model with the injected quantile stats.
+    _eef_model_config: Any | None = None
     # FT history mode: read precomputed wrench_history column instead of runtime collection.
     use_ft_history: bool = False
     ft_history_steps: int = 60
@@ -428,9 +434,6 @@ class LeRobotPiperDataConfig(DataConfigFactory):
         # If using ft history, repack the precomputed wrench_history column.
         if self.use_force_data and self.use_ft_history:
             repack_mapping["observation/wrench_history"] = "observation.wrench_history"
-        # EEF pose supervision: repack the precomputed eef_delta column.
-        if getattr(model_config, 'use_eef_loss', False):
-            repack_mapping["observation/eef_delta"] = "observation.eef_delta"
 
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_mapping)]
@@ -515,9 +518,35 @@ class LeRobotPiperDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
-        # Build action_sequence_keys — include force/torque if predicting force.
-        # For force_in_state (dual-head), force target comes from the future state
-        # chunk, so observation.state must be sampled with delta_timestamps too.
+        # EEF pose loss: inject quantile norm stats (q01/q99) into the model config
+        # so compute_loss can unnormalize joints back to physical space before FK.
+        # The dataset norm_stats are loaded by create_base_config; we pick the
+        # `actions` (joint delta) and `state` (absolute joints) quantiles.
+        norm_stats = self._load_norm_stats(
+            epath.Path(self.assets.assets_dir or assets_dirs), self.assets.asset_id or self.repo_id
+        )
+        if (
+            getattr(model_config, "use_eef_loss", False)
+            and norm_stats is not None
+            and "actions" in norm_stats
+            and "state" in norm_stats
+        ):
+            a_stats, s_stats = norm_stats["actions"], norm_stats["state"]
+            # actions: first 6 dims are joint deltas (7th is gripper, unused by FK).
+            # state: first 6 dims are absolute joints (7th is gripper).
+            act_q01 = np.asarray(a_stats.q01)[:6].astype(np.float32)
+            act_q99 = np.asarray(a_stats.q99)[:6].astype(np.float32)
+            st_q01 = np.asarray(s_stats.q01)[:6].astype(np.float32)
+            st_q99 = np.asarray(s_stats.q99)[:6].astype(np.float32)
+            model_config = dataclasses.replace(
+                model_config,
+                eef_action_q01=act_q01,
+                eef_action_q99=act_q99,
+                eef_state_q01=st_q01,
+                eef_state_q99=st_q99,
+            )
+            logging.info("EEF loss: injected action/state quantile norm stats (q01/q99)")
+
         action_sequence_keys = [self.action_key]
         if self.predict_force:
             if self.force_in_state:
@@ -537,6 +566,7 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             ),
             use_ft_history=getattr(model_config, "use_ft_history", False),
             ft_history_steps=getattr(model_config, "ft_history_steps", 60),
+            _eef_model_config=model_config if getattr(model_config, "use_eef_loss", False) else None,
         )
 
 
@@ -1987,6 +2017,86 @@ _CONFIGS = [
         save_interval=2000,
         keep_period=10000,
         num_train_steps=30_000,
+    ),
+    # ── Erase Board, FT History + EEF pose loss（0.7 关节 + 0.3 EEF） ──
+    # 目的：真机擦除段末端 yaw 漂移（action 自发，q4 持续转动 40°）——EEF loss
+    # 用可微 FK 把关节 delta 的"末端效果"放大，约束末端位姿（尤其姿态）。
+    #   * 数据集不动（无新增字段）
+    #   * gt = FK(q_cur + target_delta)，pred = FK(q_cur + pred_delta)
+    #   * 旋转矩阵差 loss（无回绕、无欧拉角奇异）
+    #   * total_action = 0.7 * 关节 loss + 0.3 * EEF loss
+    # 反归一化（quantile q01/q99）由 LeRobotPiperDataConfig 自动注入 model config。
+    # 需先对新数据集跑 compute_norm_stats（用户手动执行）。
+    TrainConfig(
+        name="pi05_force_erase_board_eef",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,          # K=16: 分段编码（每段 4 帧）
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,          # LIMoE+expert 力路径
+            force_head_loss_weight=0.01,     # force_out_proj head 路径
+            force_frame_spike_weight=2.0,    # 帧加权
+            # EEF pose loss: 0.7 关节 + 0.3 EEF（工具末端 0.211m 含传感器）
+            # EEF 内部分量: 0.3*位置 + 1.0*姿态（姿态主导，修 q4-q6 yaw 漂移）
+            use_eef_loss=True,
+            action_joint_weight=0.7,
+            tool_extension=0.211,
+            eef_pos_weight=0.3,
+            eef_angle_weight=1.0,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/erase_board_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="erase the board",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        # 从 3w (29999) checkpoint 热启动（含 lora/limoe/force/ft_encoder 全量权重）。
+        # 新优化器状态（不从旧 train_state 恢复）→ 干净启动 + EEF loss 新目标。
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/mnt/hdd/sfy/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
+        ),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=50_000,
     ),
     #
     # Existing Piper configs.
