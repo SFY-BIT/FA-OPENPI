@@ -74,6 +74,9 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     # Weight of the rotation (orientation) part of the EEF loss relative to
     # position. 1.0 = balanced; >1 boosts orientation (wrist) supervision.
     eef_angle_weight: float = 1.0
+    # Weight of the position part of the EEF loss.
+    # eef_loss = eef_pos_weight * pos_loss + eef_angle_weight * rot_loss
+    eef_pos_weight: float = 0.3
     # Quantile norm stats injected by LeRobotPiperDataConfig (physical-space
     # unnormalization before FK). Shapes [6] each (first 6 joint dims).
     eef_action_q01: np.ndarray | None = None
@@ -140,6 +143,7 @@ class Pi0Force(_Pi0):
         self.action_joint_weight = config.action_joint_weight
         self.tool_extension = config.tool_extension
         self.eef_angle_weight = config.eef_angle_weight
+        self.eef_pos_weight = config.eef_pos_weight
         # Quantile norm stats for physical-space unnormalization before FK
         # (injected by LeRobotPiperDataConfig when use_eef_loss=True).
         # Stored as tuples: NNX flattens bare numpy/jax arrays as param leaves
@@ -512,7 +516,7 @@ class Pi0Force(_Pi0):
                     R_diff = R_pred @ jnp.swapaxes(R_gt, -1, -2) - jnp.eye(3)
                     rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
 
-                    eef_loss = pos_loss + self.eef_angle_weight * rot_loss
+                    eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
 
             # Weighted action loss: joint-space + EEF (if enabled).
             if self.use_eef_loss:

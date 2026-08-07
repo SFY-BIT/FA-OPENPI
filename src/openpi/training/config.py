@@ -2126,6 +2126,7 @@ _CONFIGS = [
             action_joint_weight=0.7,
             tool_extension=0.211,
             eef_angle_weight=1.0,
+            eef_pos_weight=0.3,
             num_experts=4, num_top_k=1,
         ),
         new_module_lr_multiplier=5.0,
