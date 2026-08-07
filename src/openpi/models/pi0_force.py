@@ -36,9 +36,14 @@ logger = logging.getLogger("openpi")
 _COMPONENT_LOSSES: dict[str, float] = {}
 
 
-def _store_component_losses(action_loss: float, force_loss: float):
+def _store_component_losses(action_loss: float, force_loss: float,
+                            eef_loss: float = 0.0, eef_pos_loss: float = 0.0,
+                            eef_rot_loss: float = 0.0):
     _COMPONENT_LOSSES["action_loss"] = float(action_loss)
     _COMPONENT_LOSSES["force_loss"] = float(force_loss)
+    _COMPONENT_LOSSES["eef_loss"] = float(eef_loss)
+    _COMPONENT_LOSSES["eef_pos_loss"] = float(eef_pos_loss)
+    _COMPONENT_LOSSES["eef_rot_loss"] = float(eef_rot_loss)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -464,6 +469,8 @@ class Pi0Force(_Pi0):
             #   pos_loss  = ||xyz_pred - xyz_gt||^2
             #   rot_loss  = ||R_pred @ R_gt^T - I||^2_F  (no wrap, no gimbal)
             eef_loss = jnp.zeros_like(action_loss)
+            eef_pos_loss = jnp.zeros_like(action_loss)
+            eef_rot_loss = jnp.zeros_like(action_loss)
             if self.use_eef_loss:
                 if (
                     self.eef_action_q01 is not None
@@ -517,6 +524,8 @@ class Pi0Force(_Pi0):
                     rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
 
                     eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
+                    eef_pos_loss = pos_loss
+                    eef_rot_loss = rot_loss
 
             # Weighted action loss: joint-space + EEF (if enabled).
             if self.use_eef_loss:
@@ -599,6 +608,9 @@ class Pi0Force(_Pi0):
                 _store_component_losses,
                 jnp.mean(action_loss_weighted),
                 jnp.mean(force_loss),
+                jnp.mean(eef_loss),
+                jnp.mean(eef_pos_loss),
+                jnp.mean(eef_rot_loss),
             )
             return total_loss
 
