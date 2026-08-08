@@ -2049,13 +2049,15 @@ _CONFIGS = [
             force_loss_weight=0.01,          # LIMoE+expert 力路径
             force_head_loss_weight=0.01,     # force_out_proj head 路径
             force_frame_spike_weight=2.0,    # 帧加权
-            # EEF pose loss: 0.7 关节 + 0.3 EEF（工具末端 0.211m 含传感器）
-            # EEF 内部分量: 0.3*位置 + 1.0*姿态（姿态主导，修 q4-q6 yaw 漂移）
+            # EEF pose loss: 0.5 关节 + 0.5 EEF（工具末端 0.211m 含传感器）
+            # EEF 内部分量: 0.3*位置 + 3.0*姿态（姿态主导，修 q4-q6 yaw 漂移）
+            # 权重提升原因: flow-matching 中 q4 delta 信号被噪声淹没(SNR 0.08),
+            # joint loss 对 q4 几乎无监督, EEF 是唯一监督 q4 的信号, 需提高权重。
             use_eef_loss=True,
-            action_joint_weight=0.7,
+            action_joint_weight=0.5,
             tool_extension=0.211,
             eef_pos_weight=0.3,
-            eef_angle_weight=1.0,
+            eef_angle_weight=3.0,
             num_experts=4, num_top_k=1,
         ),
         new_module_lr_multiplier=5.0,
@@ -2123,9 +2125,9 @@ _CONFIGS = [
             force_head_loss_weight=0.01,
             force_frame_spike_weight=2.0,
             use_eef_loss=True,
-            action_joint_weight=0.7,
+            action_joint_weight=0.5,
             tool_extension=0.211,
-            eef_angle_weight=1.0,
+            eef_angle_weight=3.0,
             eef_pos_weight=0.3,
             num_experts=4, num_top_k=1,
         ),

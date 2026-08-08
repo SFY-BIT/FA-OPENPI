@@ -37,12 +37,12 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 echo "=== EEF dual-space pose loss training (hot-start 29999) ==="
 python scripts/train.py pi05_force_erase_board_eef_remote \
     --exp-name=erase_board_eef \
-    --overwrite \
-    --batch_size=32 \
+    --resume \
+    --batch_size=64 \
     --num_workers=0 \
     --num_train_steps=50000 \
     --log_interval=10 \
-    --save_interval=2000 \
-    --keep_period=10000
+    --save_interval=500 \
+    --keep_period=2000
 
 echo "=== Training finished ==="
