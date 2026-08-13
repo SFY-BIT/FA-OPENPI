@@ -38,26 +38,36 @@ JOINT_DIMS = slice(0, 6)
 GRIPPER_DIM = 6
 
 
+# JIT 编译的单帧 FK（避免 fk_batch 的 batch 依赖 + 避免非 jit 的 Python 开销）
+import jax
+import jax.numpy as jnp
+
+_fk_jit = jax.jit(jfk.fk)
+
+
+def _T_to_eef6(T: np.ndarray) -> np.ndarray:
+    """4x4 齐次变换 → [xyz, rpy] (ZYX 欧拉角, 与 pose_from_joints 一致)。"""
+    xyz = T[:3, 3]
+    R = T[:3, :3]
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    pitch = np.arctan2(-R[2, 0], sy)
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    return np.concatenate([xyz, [roll, pitch, yaw]]).astype(np.float32)
+
+
 def joints_to_eef6_batch(joints_all: np.ndarray, tool_extension: float) -> np.ndarray:
     """批量: 关节角 [N, 6] → EEF 位姿 [N, 6] (xyz + rpy)。
 
-    注意: 逐帧调用单帧 fk() (非 fk_batch vmap), 因为 fk_batch 的
-    结果依赖 batch 大小 (XLA 浮点重排, 0.6mm 级差异), 逐帧最稳定。
+    逐帧调用 JIT 编译的单帧 fk()：结果与单帧基准完全一致（fk_batch 的
+    结果依赖 batch 大小, XLA 浮点重排, 0.6mm 级差异），且 JIT 后
+    ~0.2ms/帧, 5 万帧约 10 秒。
     """
-    import jax
-    import jax.numpy as jnp
     N = joints_all.shape[0]
     eef = np.zeros((N, 6), dtype=np.float32)
     for i in range(N):
-        T = np.asarray(jfk.fk(jnp.asarray(joints_all[i], dtype=jnp.float32), tool_extension))
-        xyz = T[:3, 3]
-        R = T[:3, :3]
-        # ZYX 欧拉角 (与 pose_from_joints 一致)
-        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-        roll = np.arctan2(R[2, 1], R[2, 2])
-        pitch = np.arctan2(-R[2, 0], sy)
-        yaw = np.arctan2(R[1, 0], R[0, 0])
-        eef[i] = np.concatenate([xyz, [roll, pitch, yaw]])
+        T = np.asarray(_fk_jit(jnp.asarray(joints_all[i], dtype=jnp.float32), tool_extension))
+        eef[i] = _T_to_eef6(T)
     return eef
 
 

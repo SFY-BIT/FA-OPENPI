@@ -2695,6 +2695,8 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_force_total_task_joint_only",
+        # NOTE: 数据集是 total_task_flexiv_ft60 (带 wrench_history 列);
+        #       repo_id 用 ft60 名, 因为 use_ft_history=True 需要该列.
         model=pi0_force.Pi0ForceConfig(
             pi05=True, action_horizon=30, discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
@@ -2720,7 +2722,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/data/group1/junjie008/datasets/total_task_flexiv",
+            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -2792,7 +2794,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/data/group1/junjie008/datasets/total_task_flexiv",
+            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
