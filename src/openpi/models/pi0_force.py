@@ -361,13 +361,22 @@ class Pi0Force(_Pi0):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        train_step: at.Array | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        # Training step for EEF warmup (set by train_step via model._train_step).
-        train_step = getattr(self, "_train_step", None)
+        # Training step for EEF warmup (passed from train_step; None e.g. during eval).
+        # NOTE: do NOT stash this on the model instance (e.g. self._train_step = ...);
+        # nnx value_and_grad splits model attributes as leaves and a traced array
+        # attribute breaks the graph flatten.
+        eef_cur_step = train_step
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -555,11 +564,11 @@ class Pi0Force(_Pi0):
                 # During warmup the joint loss dominates; EEF ramps in linearly.
                 eef_scale = 1.0
                 if self.eef_warmup_steps > 0:
-                    if train_step is None:
+                    if eef_cur_step is None:
                         eef_scale = 0.0  # no step info (e.g. eval) -> EEF off
                     else:
                         eef_scale = jnp.clip(
-                            train_step / self.eef_warmup_steps, 0.0, 1.0
+                            eef_cur_step / self.eef_warmup_steps, 0.0, 1.0
                         )
                 joint_part = self.action_joint_weight * action_loss
                 eef_part = (1.0 - self.action_joint_weight) * eef_loss * eef_scale

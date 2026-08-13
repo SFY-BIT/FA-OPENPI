@@ -208,14 +208,14 @@ def train_step(
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
-    # Expose the current training step to compute_loss (for EEF warmup).
-    model._train_step = state.step
 
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        chunked_loss = model.compute_loss(
+            rng, observation, actions, train=True, train_step=state.step
+        )
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
