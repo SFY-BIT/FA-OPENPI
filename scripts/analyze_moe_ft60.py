@@ -68,6 +68,8 @@ def main():
     p.add_argument("--max-frames",type=int,default=0)
     p.add_argument("--k-force",type=int,default=K_FORCE_DEFAULT,
                    help="Number of force tokens at the end of the sequence (1 for K=1, 16 for K=16)")
+    p.add_argument("--prompt",default="stamp seal",
+                   help="Task prompt (e.g. 'erase the board')")
     p.add_argument("--output-dir",default="outputs/moe_ft60")
     args=p.parse_args()
 
@@ -145,7 +147,7 @@ def main():
                     "observation/state":np.asarray(frm["observation.state"],dtype=np.float32),
                     "observation/image":np.asarray(decode_image(frm["observation.image"])),
                     "observation/wrist_image":np.asarray(decode_image(frm["observation.wrist_image"])),
-                    "prompt":"stamp seal",
+                    "prompt":args.prompt,
                 }
                 # ft60 数据集新增了 wrench_history 列 [T,6]
                 if "observation.wrench_history" in frm:

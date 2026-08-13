@@ -2100,6 +2100,79 @@ _CONFIGS = [
         keep_period=10000,
         num_train_steps=50_000,
     ),
+    # ── EEF-only 消融版（本地）：只用 EEF loss，joint loss 只算不参与总 loss ──
+    #   用途: 验证纯 EEF 监督能否单独驱动 q4/q5/q6 学到正确位姿 (消融实验)
+    #   与 pi05_force_erase_board_eef 唯一区别: eef_only_mode=True
+    #   (compute_loss 里 action_loss_weighted = eef_loss, joint loss 仅日志播报)
+    TrainConfig(
+        name="pi05_force_erase_board_eef_only",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,
+            force_head_loss_weight=0.01,
+            force_frame_spike_weight=2.0,
+            # EEF-only: joint loss 只算不参与总 loss (eef_only_mode=True)
+            use_eef_loss=True,
+            eef_only_mode=True,
+            action_joint_weight=0.6,   # 保留但 eef_only_mode 下不用
+            tool_extension=0.211,
+            eef_pos_weight=0.3,
+            eef_angle_weight=2.0,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/mnt/hdd/sfy/datasets/erase_board_flexiv_ft60",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="erase the board",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/mnt/hdd/sfy/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
+        ),
+        log_interval=10,
+        save_interval=500,
+        keep_period=10000,
+        num_train_steps=10_000,
+    ),
     # ── EEF 全参远端版（与本地 pi05_force_erase_board_eef 唯一区别：
     #    repo_id 与 weight_loader 指向远端 /data/group1/junjie008 路径）──
     TrainConfig(

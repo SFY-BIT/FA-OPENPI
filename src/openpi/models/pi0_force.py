@@ -74,6 +74,9 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     # Weight of the joint-space action loss (the rest goes to EEF loss).
     # total_action = action_joint_weight * joint_loss + (1 - action_joint_weight) * eef_loss
     action_joint_weight: float = 0.7
+    # If True, only EEF loss is used for the action term (joint loss is computed
+    # and logged but NOT added to the total loss). Ablation for EEF-only training.
+    eef_only_mode: bool = False
     # Tool extension (m): link6 → gripper(0.13503) + force sensor(0.076) = 0.211
     tool_extension: float = 0.211
     # Weight of the rotation (orientation) part of the EEF loss relative to
@@ -146,6 +149,7 @@ class Pi0Force(_Pi0):
         # EEF pose loss config
         self.use_eef_loss = config.use_eef_loss
         self.action_joint_weight = config.action_joint_weight
+        self.eef_only_mode = config.eef_only_mode
         self.tool_extension = config.tool_extension
         self.eef_angle_weight = config.eef_angle_weight
         self.eef_pos_weight = config.eef_pos_weight
@@ -524,11 +528,19 @@ class Pi0Force(_Pi0):
                     rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
 
                     eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
+                    # In eef_only_mode, use UNWEIGHTED EEF loss (pos+rot each 1.0)
+                    # so the ablation isolates pure EEF supervision without the
+                    # internal 0.3*pos + 2.0*rot weighting skewing the scale.
+                    eef_loss_unweighted = pos_loss + rot_loss
                     eef_pos_loss = pos_loss
                     eef_rot_loss = rot_loss
 
             # Weighted action loss: joint-space + EEF (if enabled).
-            if self.use_eef_loss:
+            if self.use_eef_loss and self.eef_only_mode:
+                # EEF-only ablation: joint loss is computed/logged but NOT in total.
+                # Use unweighted EEF (pos+rot @ 1.0 each) for a clean ablation.
+                action_loss_weighted = eef_loss_unweighted
+            elif self.use_eef_loss:
                 joint_part = self.action_joint_weight * action_loss
                 eef_part = (1.0 - self.action_joint_weight) * eef_loss
                 action_loss_weighted = joint_part + eef_part
