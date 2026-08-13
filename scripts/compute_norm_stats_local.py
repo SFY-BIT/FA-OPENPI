@@ -92,8 +92,9 @@ def main(config_name: str, local_repo_dir: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = pathlib.Path(local_repo_dir) / "norm_stats.json"
-    print(f"[norm-stats-local] Writing stats to: {output_path}")
+    # normalize.save appends "norm_stats.json" internally → pass the repo dir.
+    output_path = pathlib.Path(local_repo_dir)
+    print(f"[norm-stats-local] Writing stats to: {output_path / 'norm_stats.json'}")
     normalize.save(output_path, norm_stats)
     for key, st in norm_stats.items():
         print(f"  {key}: dim={len(st.mean)} q01={np.round(np.asarray(st.q01)[:3], 3)}")
