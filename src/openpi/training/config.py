@@ -2620,6 +2620,214 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # ── total_task 数据集 (EEF 坐标 state): 3 个监督模式消融 ──
+    # 数据集: convert_dataset_to_eef.py 转换后 (state 前 6 维 = EEF xyz+rpy, gripper 不变)
+    # 通用字段: repo_id /data/group1/junjie008/datasets/total_task_flexiv_eef (远端)
+    #           weight_loader 指向 3w (29999) checkpoint
+    # 3 变体:
+    #   1) eef_only  : 只用 EEF loss (joint loss 只播报)
+    #   2) joint_only: 只用 joint loss (use_eef_loss=False)
+    #   3) joint_eef  : joint + EEF, 老权重 (0.7/1.0), EEF warmup 2w 步后才生效
+    TrainConfig(
+        name="pi05_force_total_task_eef_only",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,
+            force_head_loss_weight=0.01,
+            force_frame_spike_weight=2.0,
+            # EEF-only: 数据集已转换为 EEF 坐标 (state/action 前 6 维 = EEF xyz+rpy),
+            # loss 直接在 EEF 空间算, 无需 FK 分支 (use_eef_loss=False)。
+            use_eef_loss=False,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_eef",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
+        ),
+        log_interval=10,
+        save_interval=500,
+        keep_period=2000,
+        num_train_steps=50_000,
+    ),
+    TrainConfig(
+        name="pi05_force_total_task_joint_only",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,
+            force_head_loss_weight=0.01,
+            force_frame_spike_weight=2.0,
+            use_eef_loss=False,          # 纯 joint loss (原数据集)
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_task_flexiv",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
+        ),
+        log_interval=10,
+        save_interval=500,
+        keep_period=2000,
+        num_train_steps=50_000,
+    ),
+    TrainConfig(
+        name="pi05_force_total_task_eef_joint",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=7,
+            force_start_idx=7,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,
+            force_head_loss_weight=0.01,
+            force_frame_spike_weight=2.0,
+            # joint + EEF: 老权重 (0.7 joint + 0.3 EEF, pos 0.3 + rot 1.0)
+            # EEF warmup 2w 步: 前 20000 步 EEF 线性升温, joint 主导;
+            # 20000-30000 步 EEF 完全生效 (联合训练)。
+            use_eef_loss=True,
+            eef_only_mode=False,
+            eef_warmup_steps=20000,     # EEF 在 2w 步后才完全生效
+            action_joint_weight=0.7,    # 老权重
+            tool_extension=0.211,
+            eef_pos_weight=0.3,         # 老权重
+            eef_angle_weight=1.0,       # 老权重
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_task_flexiv",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader(
+            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
+        ),
+        log_interval=10,
+        save_interval=500,
+        keep_period=2000,
+        num_train_steps=50_000,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

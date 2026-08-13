@@ -77,6 +77,12 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     # If True, only EEF loss is used for the action term (joint loss is computed
     # and logged but NOT added to the total loss). Ablation for EEF-only training.
     eef_only_mode: bool = False
+    # EEF warmup steps: during the first `eef_warmup_steps` training steps the
+    # EEF loss is scaled by min(1, step / eef_warmup_steps) (linear ramp).
+    # This lets the model first learn a reasonable joint-space behavior before
+    # the EEF pose supervision kicks in (avoids large initial EEF gradients).
+    # 0 disables warmup.
+    eef_warmup_steps: int = 0
     # Tool extension (m): link6 → gripper(0.13503) + force sensor(0.076) = 0.211
     tool_extension: float = 0.211
     # Weight of the rotation (orientation) part of the EEF loss relative to
@@ -150,6 +156,7 @@ class Pi0Force(_Pi0):
         self.use_eef_loss = config.use_eef_loss
         self.action_joint_weight = config.action_joint_weight
         self.eef_only_mode = config.eef_only_mode
+        self.eef_warmup_steps = config.eef_warmup_steps
         self.tool_extension = config.tool_extension
         self.eef_angle_weight = config.eef_angle_weight
         self.eef_pos_weight = config.eef_pos_weight
@@ -359,6 +366,9 @@ class Pi0Force(_Pi0):
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
+        # Training step for EEF warmup (set by train_step via model._train_step).
+        train_step = getattr(self, "_train_step", None)
+
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
@@ -541,8 +551,18 @@ class Pi0Force(_Pi0):
                 # Use unweighted EEF (pos+rot @ 1.0 each) for a clean ablation.
                 action_loss_weighted = eef_loss_unweighted
             elif self.use_eef_loss:
+                # EEF warmup: scale EEF loss by min(1, step / eef_warmup_steps).
+                # During warmup the joint loss dominates; EEF ramps in linearly.
+                eef_scale = 1.0
+                if self.eef_warmup_steps > 0:
+                    if train_step is None:
+                        eef_scale = 0.0  # no step info (e.g. eval) -> EEF off
+                    else:
+                        eef_scale = jnp.clip(
+                            train_step / self.eef_warmup_steps, 0.0, 1.0
+                        )
                 joint_part = self.action_joint_weight * action_loss
-                eef_part = (1.0 - self.action_joint_weight) * eef_loss
+                eef_part = (1.0 - self.action_joint_weight) * eef_loss * eef_scale
                 action_loss_weighted = joint_part + eef_part
             else:
                 action_loss_weighted = action_loss
