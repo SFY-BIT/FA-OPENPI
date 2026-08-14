@@ -2674,7 +2674,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -2738,7 +2738,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -2780,11 +2780,11 @@ _CONFIGS = [
             force_head_loss_weight=0.01,
             force_frame_spike_weight=2.0,
             # joint + EEF: 老权重 (0.7 joint + 0.3 EEF, pos 0.3 + rot 1.0)
-            # EEF warmup 2w2 步: 前 22000 步 EEF 线性升温, joint 主导;
-            # 22000-30000 步 EEF 完全生效 (联合训练)。
+            # EEF warmup 3w 步: 前 30000 步 EEF 线性升温, joint 主导;
+            # 30000-40000 步 EEF 完全生效 (联合训练)。
             use_eef_loss=True,
             eef_only_mode=False,
-            eef_warmup_steps=22000,     # EEF 在 2w2 步后才完全生效
+            eef_warmup_steps=30000,     # EEF 在 3w 步后才完全生效
             action_joint_weight=0.7,    # 老权重
             tool_extension=0.211,
             eef_pos_weight=0.3,         # 老权重
@@ -2809,7 +2809,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -2879,7 +2879,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -2941,7 +2941,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -2983,10 +2983,10 @@ _CONFIGS = [
             force_head_loss_weight=0.01,
             force_frame_spike_weight=2.0,
             # joint + EEF: 老权重 (0.7 joint + 0.3 EEF, pos 0.3 + rot 1.0)
-            # EEF warmup 2w 步: 前 20000 步 EEF 线性升温, joint 主导
+            # EEF warmup 3w 步: 前 30000 步 EEF 线性升温, joint 主导
             use_eef_loss=True,
             eef_only_mode=False,
-            eef_warmup_steps=20000,
+            eef_warmup_steps=30000,
             action_joint_weight=0.7,
             tool_extension=0.211,
             eef_pos_weight=0.3,
@@ -3011,7 +3011,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -3079,7 +3079,7 @@ _CONFIGS = [
         ),
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -3141,7 +3141,7 @@ _CONFIGS = [
         ),
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -3183,10 +3183,10 @@ _CONFIGS = [
             force_head_loss_weight=0.01,
             force_frame_spike_weight=2.0,
             # joint + EEF: 老权重 (0.7 joint + 0.3 EEF, pos 0.3 + rot 1.0)
-            # EEF warmup 2w2 步: 前 22000 步 EEF 线性升温, joint 主导
+            # EEF warmup 3w 步: 前 30000 步 EEF 线性升温, joint 主导
             use_eef_loss=True,
             eef_only_mode=False,
-            eef_warmup_steps=22000,
+            eef_warmup_steps=30000,
             action_joint_weight=0.7,
             tool_extension=0.211,
             eef_pos_weight=0.3,
@@ -3211,7 +3211,7 @@ _CONFIGS = [
         ),
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=2000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
