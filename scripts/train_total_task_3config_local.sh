@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# total_task 3 config 串行训练 (每个 5000 步, 只保留最后 ckpt)
+# total_2task 3 config 串行训练 (每个 5000 步, 只保留最后 ckpt)
 #   顺序: eef_only → joint_only → eef_joint (GPU 0 串行)
 #   bs=8 | 每步 ~18s → 每 config ~4-5h, 总共 ~13-15h
 #   save_interval=100000 > 5000 → 只在最后一步(4999)保存
@@ -22,38 +22,38 @@ mkdir -p logs checkpoints
 COMMON="--num_train_steps=5000 --save_interval=100000 --log_interval=10 --batch_size=8 --num_workers=2"
 
 echo "############################################################"
-echo "# [1/3] eef_only_local (total_task_flexiv_eef, EEF 空间 loss)"
+echo "# [1/3] eef_only_local (total_2task_flexiv_eef, EEF 空间 loss)"
 echo "############################################################"
 python -u scripts/train.py pi05_force_total_task_eef_only_local \
-    --exp-name=total_task_5k \
+    --exp-name=total_2task_5k \
     --overwrite \
     $COMMON \
-    2>&1 | tee logs/total_task_eef_only_5k.log
+    2>&1 | tee logs/total_2task_eef_only_5k.log
 echo "=== [1/3] eef_only 完成 $(date) ==="
 
 echo "############################################################"
-echo "# [2/3] joint_only_local (total_task_flexiv_ft60, 纯 joint)"
+echo "# [2/3] joint_only_local (total_2task_flexiv_ft60, 纯 joint)"
 echo "############################################################"
 python -u scripts/train.py pi05_force_total_task_joint_only_local \
-    --exp-name=total_task_5k \
+    --exp-name=total_2task_5k \
     --overwrite \
     $COMMON \
-    2>&1 | tee logs/total_task_joint_only_5k.log
+    2>&1 | tee logs/total_2task_joint_only_5k.log
 echo "=== [2/3] joint_only 完成 $(date) ==="
 
 echo "############################################################"
 echo "# [3/3] eef_joint_local (joint + FK EEF, warmup 2w)"
 echo "############################################################"
 python -u scripts/train.py pi05_force_total_task_eef_joint_local \
-    --exp-name=total_task_5k \
+    --exp-name=total_2task_5k \
     --overwrite \
     $COMMON \
-    2>&1 | tee logs/total_task_eef_joint_5k.log
+    2>&1 | tee logs/total_2task_eef_joint_5k.log
 echo "=== [3/3] eef_joint 完成 $(date) ==="
 
 echo "############################################################"
 echo "# 全部完成! checkpoints:"
-echo "#   checkpoints/pi05_force_total_task_eef_only_local/total_task_5k/4999"
-echo "#   checkpoints/pi05_force_total_task_joint_only_local/total_task_5k/4999"
-echo "#   checkpoints/pi05_force_total_task_eef_joint_local/total_task_5k/4999"
+echo "#   checkpoints/pi05_force_total_task_eef_only_local/total_2task_5k/4999"
+echo "#   checkpoints/pi05_force_total_task_joint_only_local/total_2task_5k/4999"
+echo "#   checkpoints/pi05_force_total_task_eef_joint_local/total_2task_5k/4999"
 echo "############################################################"
