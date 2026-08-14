@@ -2686,13 +2686,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（不传 29999；limoe/force/ft_encoder 随机初始化）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_joint_only_remote",
@@ -2751,13 +2750,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（不传 29999；limoe/force/ft_encoder 随机初始化）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_eef_joint_remote",
@@ -2823,20 +2821,19 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（不传 29999；limoe/force/ft_encoder 随机初始化）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
     # ────────────────────────────────────────────────────────────────────────
     # total_task 本地测试版 (bs=8, 本地数据集/权重路径) — 与远端同名 config 一一对应
     #   eef_only_local : 数据集 total_2task_flexiv_eef (EEF 坐标, loss 直接算)
     #   joint_only_local: 数据集 total_2task_flexiv_ft60 (纯 joint loss)
     #   eef_joint_local : 数据集 total_2task_flexiv_ft60 (joint + FK EEF, warmup 2w)
-    # 权重: 本地 29999 checkpoint 热启动
+    # 权重: pi05_base 冷启动（与远端一致）
     # ────────────────────────────────────────────────────────────────────────
     TrainConfig(
         name="pi05_force_total_task_eef_only_local",
@@ -2894,13 +2891,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/mnt/hdd/sfy/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（与远端一致）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=50_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_joint_only_local",
@@ -2957,13 +2953,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/mnt/hdd/sfy/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（与远端一致）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=50_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_eef_joint_local",
@@ -3028,13 +3023,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/mnt/hdd/sfy/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动（与远端一致）
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=50_000,
+        num_train_steps=40_000,
     ),
     # ────────────────────────────────────────────────────────────────────────
     # total_2task standard 展示 config (bs=16) — 训练不调用, 仅作为标准参照
@@ -3097,13 +3091,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_joint_only_standard",
@@ -3160,13 +3153,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
     TrainConfig(
         name="pi05_force_total_task_eef_joint_standard",
@@ -3231,13 +3223,12 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        weight_loader=weight_loaders.Pi0ForceWeightLoader(
-            "/data/group1/junjie008/FA-openpi/checkpoints/pi05_force_erase_board_ft60_forcevla_lora_k16/erase_board_ft60_k16_w001/29999/params"
-        ),
+        # pi05_base 冷启动
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
-        num_train_steps=30_000,
+        num_train_steps=40_000,
     ),
 ]
 
