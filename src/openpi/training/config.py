@@ -2622,7 +2622,7 @@ _CONFIGS = [
     *polaris_config.get_polaris_configs(),
     # ── total_task 数据集 (EEF 坐标 state): 3 个监督模式消融 (远端 LoRA) ──
     # 数据集: convert_dataset_to_eef.py 转换后 (state 前 6 维 = EEF xyz+rpy, gripper 不变)
-    # 通用字段: repo_id /data/group1/junjie008/datasets/total_task_flexiv_eef (远端)
+    # 通用字段: repo_id /data/group1/junjie008/datasets/total_2task_flexiv_eef (远端)
     #           weight_loader 指向 3w (29999) checkpoint
     # 与 *_local 差异: 仅 repo_id (远端路径) + warmup 步数 (2w2) + bs=32 + 3w 步
     # 3 变体:
@@ -2658,7 +2658,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_eef",
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -2696,7 +2696,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_force_total_task_joint_only_remote",
-        # NOTE: 数据集是 total_task_flexiv_ft60 (带 wrench_history 列);
+        # NOTE: 数据集是 total_2task_flexiv_ft60 (带 wrench_history 列);
         #       repo_id 用 ft60 名, 因为 use_ft_history=True 需要该列.
         model=pi0_force.Pi0ForceConfig(
             pi05=True, action_horizon=30, discrete_state_input=False,
@@ -2723,7 +2723,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_ft60",
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -2795,7 +2795,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/data/group1/junjie008/datasets/total_task_flexiv_ft60",
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -2833,9 +2833,9 @@ _CONFIGS = [
     ),
     # ────────────────────────────────────────────────────────────────────────
     # total_task 本地测试版 (bs=8, 本地数据集/权重路径) — 与远端同名 config 一一对应
-    #   eef_only_local : 数据集 total_task_flexiv_eef (EEF 坐标, loss 直接算)
-    #   joint_only_local: 数据集 total_task_flexiv_ft60 (纯 joint loss)
-    #   eef_joint_local : 数据集 total_task_flexiv_ft60 (joint + FK EEF, warmup 2w)
+    #   eef_only_local : 数据集 total_2task_flexiv_eef (EEF 坐标, loss 直接算)
+    #   joint_only_local: 数据集 total_2task_flexiv_ft60 (纯 joint loss)
+    #   eef_joint_local : 数据集 total_2task_flexiv_ft60 (joint + FK EEF, warmup 2w)
     # 权重: 本地 29999 checkpoint 热启动
     # ────────────────────────────────────────────────────────────────────────
     TrainConfig(
@@ -2866,7 +2866,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/datasets/total_task_flexiv_eef",
+            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_eef",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -2929,7 +2929,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/datasets/total_task_flexiv_ft60",
+            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -3000,7 +3000,7 @@ _CONFIGS = [
         ),
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/datasets/total_task_flexiv_ft60",
+            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
