@@ -2620,16 +2620,17 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
-    # ── total_task 数据集 (EEF 坐标 state): 3 个监督模式消融 ──
+    # ── total_task 数据集 (EEF 坐标 state): 3 个监督模式消融 (远端 LoRA) ──
     # 数据集: convert_dataset_to_eef.py 转换后 (state 前 6 维 = EEF xyz+rpy, gripper 不变)
     # 通用字段: repo_id /data/group1/junjie008/datasets/total_task_flexiv_eef (远端)
     #           weight_loader 指向 3w (29999) checkpoint
+    # 与 *_local 差异: 仅 repo_id (远端路径) + warmup 步数 (2w2) + bs=32 + 3w 步
     # 3 变体:
     #   1) eef_only  : 只用 EEF loss (joint loss 只播报)
     #   2) joint_only: 只用 joint loss (use_eef_loss=False)
-    #   3) joint_eef  : joint + EEF, 老权重 (0.7/1.0), EEF warmup 2w 步后才生效
+    #   3) joint_eef  : joint + EEF, 老权重 (0.7/1.0), EEF warmup 2w2 步后完成
     TrainConfig(
-        name="pi05_force_total_task_eef_only",
+        name="pi05_force_total_task_eef_only_remote",
         model=pi0_force.Pi0ForceConfig(
             pi05=True, action_horizon=30, discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
@@ -2691,10 +2692,10 @@ _CONFIGS = [
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=50_000,
+        num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi05_force_total_task_joint_only",
+        name="pi05_force_total_task_joint_only_remote",
         # NOTE: 数据集是 total_task_flexiv_ft60 (带 wrench_history 列);
         #       repo_id 用 ft60 名, 因为 use_ft_history=True 需要该列.
         model=pi0_force.Pi0ForceConfig(
@@ -2756,10 +2757,10 @@ _CONFIGS = [
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=50_000,
+        num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi05_force_total_task_eef_joint",
+        name="pi05_force_total_task_eef_joint_remote",
         model=pi0_force.Pi0ForceConfig(
             pi05=True, action_horizon=30, discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
@@ -2781,11 +2782,11 @@ _CONFIGS = [
             force_head_loss_weight=0.01,
             force_frame_spike_weight=2.0,
             # joint + EEF: 老权重 (0.7 joint + 0.3 EEF, pos 0.3 + rot 1.0)
-            # EEF warmup 2w 步: 前 20000 步 EEF 线性升温, joint 主导;
-            # 20000-30000 步 EEF 完全生效 (联合训练)。
+            # EEF warmup 2w2 步: 前 22000 步 EEF 线性升温, joint 主导;
+            # 22000-30000 步 EEF 完全生效 (联合训练)。
             use_eef_loss=True,
             eef_only_mode=False,
-            eef_warmup_steps=20000,     # EEF 在 2w 步后才完全生效
+            eef_warmup_steps=22000,     # EEF 在 2w2 步后才完全生效
             action_joint_weight=0.7,    # 老权重
             tool_extension=0.211,
             eef_pos_weight=0.3,         # 老权重
@@ -2828,7 +2829,7 @@ _CONFIGS = [
         log_interval=10,
         save_interval=500,
         keep_period=2000,
-        num_train_steps=50_000,
+        num_train_steps=30_000,
     ),
     # ────────────────────────────────────────────────────────────────────────
     # total_task 本地测试版 (bs=8, 本地数据集/权重路径) — 与远端同名 config 一一对应
