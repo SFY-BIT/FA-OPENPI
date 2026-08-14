@@ -38,7 +38,7 @@ nvidia-smi
 # 并行阶段参数: 每进程 45% 显存
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-PARALLEL_COMMON="--num_train_steps=30000 --save_interval=2000 --keep_period=10000 --log_interval=10 --num_workers=4"
+PARALLEL_COMMON="--num_train_steps=40000 --save_interval=2000 --keep_period=10000 --log_interval=10 --num_workers=4"
 
 echo "############################################################"
 echo "# [阶段 1a] eef_only_remote  (EEF 空间 loss, bs=8) 并行启动"
