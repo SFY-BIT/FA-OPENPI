@@ -199,6 +199,20 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _get_compute_loss_params(model) -> set[str]:
+    """compute_loss 的显式参数名 (不含 self/star args)。
+
+    用于判断模型是否支持 train_step 参数 (Pi0Force 有, 纯 Pi0 没有)。
+    """
+    import inspect
+    try:
+        sig = inspect.signature(model.compute_loss)
+        return {p.name for p in sig.parameters.values()
+                if p.name != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)}
+    except (ValueError, TypeError):
+        return set()
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -213,9 +227,12 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(
-            rng, observation, actions, train=True, train_step=state.step
-        )
+        # train_step 是 Pi0Force 特有参数 (EEF warmup); 纯 pi05 (Pi0) 不支持,
+        # 用 getattr 判断避免 TypeError。
+        kwargs = {}
+        if hasattr(model, "compute_loss") and "train_step" in _get_compute_loss_params(model):
+            kwargs["train_step"] = state.step
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True, **kwargs)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
