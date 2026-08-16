@@ -3246,7 +3246,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60",
+            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60_noforce",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -3283,7 +3283,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_eef",
+            repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_eef_noforce",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
