@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 
+import jax.numpy as jnp
 import tyro
 
 
@@ -82,6 +83,13 @@ class EnvMode(enum.Enum):
     LIBERO = "libero"
 
 
+class ActionSpace(enum.Enum):
+    """动作空间: joint（关节 delta/绝对）或 eef（末端 6D 位姿）。"""
+
+    JOINT = "joint"
+    EEF = "eef"
+
+
 @dataclasses.dataclass
 class Checkpoint:
     """Load a policy from a trained checkpoint."""
@@ -119,6 +127,14 @@ class Args:
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+
+    # Action space: "joint" (default, 关节绝对位置) or "eef" (末端 6D 位姿 xyz+rpy).
+    # In EEF mode the server converts client joint obs -> EEF via FK before inference,
+    # and converts model EEF actions -> joint via numerical IK after inference.
+    # Requires piper_fk_jax (Piper 6-DoF, tool_extension 0.211 incl. sensor).
+    action_space: ActionSpace = ActionSpace.JOINT
+    # Tool extension used for FK/IK when action_space=eef (default 0.211 = gripper + sensor).
+    tool_extension: float = 0.211
 
 
 # Default checkpoints that should be used for each environment.
@@ -217,13 +233,87 @@ def _filter_output_norm_stats(norm_stats: dict | None) -> dict | None:
     return filtered
 
 
+class EefActionPolicyWrapper(_policy.Policy):
+    """Wrap a joint-space policy for EEF action space (input FK, output IK).
+
+    输入（client 发 joint）→ FK → EEF 给模型推理
+    模型输出 EEF action → IK → joint 返回 client
+
+    坐标系与训练完全一致: piper_fk_jax 的 fk()/eef_ik() 都带 tool_extension
+    (0.211 = 夹爪 0.13503 + 传感器 0.076), 与数据集转换/EEF loss 同一套。
+    """
+
+    def __init__(self, policy: _policy.Policy, *, tool_extension: float = 0.211):
+        self._inner = policy
+        self._tool_extension = tool_extension
+        # metadata 透传
+        self.metadata = policy.metadata
+
+    def infer(self, obs: dict, *, noise=None) -> dict:
+        import numpy as np
+        from openpi.models import piper_fk_jax as _jfk
+
+        # ── 输入转换: joint state [7] -> EEF state [7] (前 6 维 FK) ──
+        obs = dict(obs)
+        state = np.asarray(obs["observation/state"], dtype=np.float32)
+        if state.ndim > 1:
+            state = state[0]
+        joints = state[:6]
+        # 单帧 FK (jit 稳定版, 与数据集转换一致)
+        T = np.asarray(_jfk.fk(jnp.asarray(joints, dtype=jnp.float32), self._tool_extension))
+        xyz = T[:3, 3]
+        R = T[:3, :3]
+        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+        eef6 = np.concatenate([
+            xyz,
+            [np.arctan2(R[2, 1], R[2, 2]), np.arctan2(-R[2, 0], sy), np.arctan2(R[1, 0], R[0, 0])],
+        ]).astype(np.float32)
+        # 保持 gripper (index 6) 不变
+        new_state = np.concatenate([eef6, state[6:7]]).astype(np.float32)
+        obs["observation/state"] = new_state
+        logging.info("[EEF-mode] FK state: %s", np.round(new_state, 4).tolist())
+
+        result = self._inner.infer(obs, noise=noise)
+
+        # ── 输出转换: EEF action [30, 7] -> joint action [30, 7] (前 6 维 IK) ──
+        if "actions" in result:
+            actions = np.asarray(result["actions"], dtype=np.float32)  # [30, 7]
+            eef_actions = actions[..., :6]  # [30, 6]
+            # 从当前关节出发迭代 IK（保证解连续）
+            q_cur = joints
+            ik_joints = []
+            for h in range(eef_actions.shape[0]):
+                target = eef_actions[h]
+                q_sol, converged, err = _jfk.eef_ik(
+                    jnp.asarray(target, dtype=jnp.float32),
+                    jnp.asarray(q_cur, dtype=jnp.float32),
+                    tool_extension=self._tool_extension,
+                )
+                q_cur = np.asarray(q_sol, dtype=np.float32)
+                ik_joints.append(q_cur)
+                if h < 2 or not bool(np.asarray(converged)):
+                    logging.info(
+                        "[EEF-mode] IK h=%d converged=%s err=%.5f q=%s",
+                        h, bool(np.asarray(converged)),
+                        float(np.asarray(np.linalg.norm(err))),
+                        np.round(q_cur, 4).tolist(),
+                    )
+            ik_joints = np.stack(ik_joints)  # [30, 6]
+            # 保持 gripper 列不变
+            result["actions"] = np.concatenate([ik_joints, actions[..., 6:7]], axis=-1)
+        return result
+
+    def reset(self) -> None:
+        self._inner.reset()
+
+
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
             norm_stats = _load_norm_stats(args.policy.dir, args.policy.config,
                                           args.norm_stats_dir)
-            return _policy_config.create_trained_policy(
+            base_policy = _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
@@ -231,7 +321,13 @@ def create_policy(args: Args) -> _policy.Policy:
                 output_norm_stats=_filter_output_norm_stats(norm_stats),
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            base_policy = create_default_policy(args.env, default_prompt=args.default_prompt)
+
+    # EEF action space: wrap with FK/IK conversion.
+    if args.action_space == ActionSpace.EEF:
+        logging.info("EEF action space enabled (FK input / IK output, tool_ext=%.3f)", args.tool_extension)
+        return EefActionPolicyWrapper(base_policy, tool_extension=args.tool_extension)
+    return base_policy
 
 
 def main(args: Args) -> None:

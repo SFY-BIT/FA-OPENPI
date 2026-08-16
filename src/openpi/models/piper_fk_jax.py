@@ -145,3 +145,64 @@ def eef_delta_from_joint_delta(
     """
     J = jacobian_batch(q_current, tool_extension)          # [..., 6, 6]
     return jnp.einsum("...ij,...j->...i", J, joint_delta)  # [..., 6]
+
+
+def eef_ik(
+    target_pose: jax.Array,
+    q_init: jax.Array,
+    tool_extension: float = DEFAULT_TOOL_EXTENSION,
+    max_iter: int = 60,
+    tol: float = 1e-4,
+    lr: float = 1.0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """数值 IK: EEF 位姿 [xyz(3), rpy(3)] → 关节角 [6]。
+
+    用含 tool_extension 延伸的雅可比迭代求解，与训练/转换用的
+    fk()/pose_from_joints() 完全同一坐标系（link6 + 夹爪 + 传感器）。
+
+    Args:
+        target_pose: [6] 目标 EEF 位姿 [x, y, z, roll, pitch, yaw]
+        q_init: [6] 初始关节角（建议用当前关节，保证解连续性）
+        tool_extension: 工具延伸长度（默认 0.211 = 夹爪 0.13503 + 传感器 0.076）
+        max_iter: 最大迭代次数
+        tol: 收敛阈值（位置 m，角度 rad）
+        lr: 更新步长（阻尼系数，0.5~1.0）
+
+    Returns:
+        (q_sol, converged, err): 解出的关节角 / 是否收敛 / 最终误差 [6]
+    """
+    lam = 1e-3
+
+    def _step(q: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        xyz, rpy = pose_from_joints(q[None, :], tool_extension)  # [1,3]
+        cur = jnp.concatenate([xyz[0], rpy[0]], axis=-1)          # [6]
+        err = target_pose - cur
+        # 角度分量回绕（避免 ±π 跳变）
+        err = err.at[3:].set(wrap_angle(err[3:]))
+        J = jacobian(q, tool_extension)                           # [6,6]
+        # 阻尼最小二乘: delta_q = (J^T J + λI)^-1 J^T err
+        dq = jnp.linalg.solve(J.T @ J + lam * jnp.eye(6), J.T @ err)
+        return q + lr * dq, err, dq
+
+    def _body(q, _):
+        q_new, _, _ = _step(q)
+        return q_new, q_new
+
+    # 固定迭代次数（避免 Python for 循环在 jit/vmap 下的 tracer 问题）。
+    q, _ = jax.lax.scan(_body, q_init, None, length=max_iter)
+    _, err, _ = _step(q)
+    converged = jnp.linalg.norm(err) < tol
+    return q, converged, err
+
+
+def eef_ik_batch(
+    target_poses: jax.Array,
+    q_inits: jax.Array,
+    tool_extension: float = DEFAULT_TOOL_EXTENSION,
+    max_iter: int = 60,
+    tol: float = 1e-4,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """批量数值 IK: target_poses [..., 6], q_inits [..., 6] → q_sol [..., 6]。"""
+    return jax.vmap(
+        lambda tp, qi: eef_ik(tp, qi, tool_extension, max_iter, tol)
+    )(target_poses, q_inits)
