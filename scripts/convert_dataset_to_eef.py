@@ -62,13 +62,55 @@ def joints_to_eef6_batch(joints_all: np.ndarray, tool_extension: float) -> np.nd
     逐帧调用 JIT 编译的单帧 fk()：结果与单帧基准完全一致（fk_batch 的
     结果依赖 batch 大小, XLA 浮点重排, 0.6mm 级差异），且 JIT 后
     ~0.2ms/帧, 5 万帧约 10 秒。
+
+    rpy 连续化 (unwrap): FK 输出的欧拉角在 ±π 边界不连续 (如 roll 3.14→-3.14
+    实际只转 0.005 rad 却表示为 6.28 rad 假跳变)。这里对相邻帧做 ±2π 展开,
+    保证 rpy 轨迹连续, 消除假 delta (这是 EEF 模型乱飞的根因之一)。
     """
     N = joints_all.shape[0]
     eef = np.zeros((N, 6), dtype=np.float32)
+    prev_rpy = None
     for i in range(N):
         T = np.asarray(_fk_jit(jnp.asarray(joints_all[i], dtype=jnp.float32), tool_extension))
-        eef[i] = _T_to_eef6(T)
+        eef6 = _T_to_eef6(T)
+        if i > 0:
+            # 相邻帧 rpy 差 > π → ±2π 展开（每维独立）
+            diff = eef6[3:] - prev_rpy
+            eef6[3:] -= np.round(diff / (2.0 * np.pi)) * (2.0 * np.pi)
+        prev_rpy = eef6[3:].copy()
+        eef[i] = eef6
     return eef
+
+
+def joints_to_eef6_batch_shared(
+    joints_state: np.ndarray, joints_action: np.ndarray, tool_extension: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """state/action 共享 unwrap 基准的 FK 转换。
+
+    state 和 action 是同一时刻的关节位置（state=当前, action=目标），它们
+    的 rpy 必须用**同一个** ±2π 展开基准，否则 action delta = target - cur
+    会因基准不同而出现巨大假值。
+    这里逐帧交替 FK state/action，prev_rpy 共享。
+    """
+    N = joints_state.shape[0]
+    eef_s = np.zeros((N, 6), dtype=np.float32)
+    eef_a = np.zeros((N, 6), dtype=np.float32)
+    prev_rpy = None
+    for i in range(N):
+        T_s = np.asarray(_fk_jit(jnp.asarray(joints_state[i], dtype=jnp.float32), tool_extension))
+        T_a = np.asarray(_fk_jit(jnp.asarray(joints_action[i], dtype=jnp.float32), tool_extension))
+        e6_s = _T_to_eef6(T_s)
+        e6_a = _T_to_eef6(T_a)
+        if i > 0:
+            # 两个都相对 prev_rpy 展开（共享基准）
+            diff_s = e6_s[3:] - prev_rpy
+            e6_s[3:] -= np.round(diff_s / (2.0 * np.pi)) * (2.0 * np.pi)
+            diff_a = e6_a[3:] - prev_rpy
+            e6_a[3:] -= np.round(diff_a / (2.0 * np.pi)) * (2.0 * np.pi)
+        prev_rpy = e6_s[3:].copy()
+        eef_s[i] = e6_s
+        eef_a[i] = e6_a
+    return eef_s, eef_a
 
 
 def convert_episode(ep_file: Path, out_file: Path, tool_extension: float) -> None:
@@ -85,11 +127,17 @@ def convert_episode(ep_file: Path, out_file: Path, tool_extension: float) -> Non
     df["observation.state"] = list(new_states)
 
     # ── action: 前 7 维 [6 关节 + gripper] → [6 EEF + gripper] ──
+    # 关键: state 和 action 必须用同一个 unwrap 基准。合并 joints 一起 FK,
+    # 共享 prev_rpy 状态, 保证两者 rpy 的 ±2π 偏移一致 → action delta 正确。
     actions = np.stack(df["action"].to_numpy())  # [N, 7]
     new_actions = actions.astype(np.float32).copy()
-    eef_actions = joints_to_eef6_batch(actions[:, JOINT_DIMS], tool_extension)  # [N, 6]
-    new_actions[:, :6] = eef_actions
+    eef_actions = joints_to_eef6_batch_shared(
+        states[:, JOINT_DIMS], actions[:, JOINT_DIMS], tool_extension
+    )  # (state_eef[N,6], action_eef[N,6])
+    new_states[:, :6] = eef_actions[0]
+    new_actions[:, :6] = eef_actions[1]
     # gripper 不变
+    df["observation.state"] = list(new_states)
     df["action"] = list(new_actions)
 
     # 写回 (保持 schema)
@@ -107,6 +155,7 @@ def main():
 
     in_dir = Path(args.input)
     out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # 复制 meta/非数据文件
     for f in in_dir.iterdir():
