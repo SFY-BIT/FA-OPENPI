@@ -32,6 +32,8 @@
 
 ## 1. 启动 server（训练/推理机）
 
+> 前台运行可实时看到播报日志。建议 tmux 分窗：一个窗口 server，一个窗口 client。
+
 ### 1.1 joint 模式（joint_only 模型）
 
 ```bash
@@ -39,13 +41,12 @@ cd /mnt/hdd/sfy/FA-openpi
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate rlinf
 
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONPATH=src \
-nohup python scripts/serve_policy.py \
+python scripts/serve_policy.py \
     --norm-stats-dir=/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60 \
     --port=8000 \
     policy:checkpoint \
     --policy.config=pi05_force_total_task_joint_only_remote \
-    --policy.dir=/mnt/hdd/sfy/FA-openpi/checkpoints/total_joint/39999 \
-    > /tmp/serve_joint.log 2>&1 &
+    --policy.dir=/mnt/hdd/sfy/FA-openpi/checkpoints/total_joint/39999
 ```
 
 ### 1.2 EEF 模式（eef_only 模型，FK 输入 / IK 输出）
@@ -55,22 +56,22 @@ cd /mnt/hdd/sfy/FA-openpi
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate rlinf
 
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONPATH=src \
-nohup python scripts/serve_policy.py \
+python scripts/serve_policy.py \
     --norm-stats-dir=/mnt/hdd/sfy/datasets/total_2task_flexiv_eef \
     --port=8000 \
     --action-space=EEF \
     policy:checkpoint \
     --policy.config=pi05_force_total_task_eef_only_remote \
-    --policy.dir=/mnt/hdd/sfy/FA-openpi/checkpoints/total_eef/39999 \
-    > /tmp/serve_eef.log 2>&1 &
+    --policy.dir=/mnt/hdd/sfy/FA-openpi/checkpoints/total_eef/39999
 ```
 
 ### 1.3 确认 server 就绪
 
 ```bash
-# 日志应显示 listening on 0.0.0.0:8000
-tail -5 /tmp/serve_joint.log   # 或 serve_eef.log
-# 端口确认
+# 终端应显示:
+#   INFO:root:Creating server (host: ..., ip: ...)
+#   INFO:websockets.server:server listening on 0.0.0.0:8000
+# 端口确认（另开终端）
 ss -tlnp | grep 8000
 ```
 
@@ -162,11 +163,11 @@ PYEOF
 ## 5. 快速命令备忘
 
 ```bash
-# 查看 server 日志
-tail -f /tmp/serve_joint.log   # joint
-tail -f /tmp/serve_eef.log     # eef
+# 前台实时播报（tmux 分窗最佳）
+tmux new -s robot              # 窗口1: server 指令
+tmux split-window -h           # 窗口2: client 指令（或 Ctrl+B c 新窗口）
 
-# 停 server
+# 停 server（另开终端）
 pkill -f "serve_policy.py"
 
 # 看 GPU
