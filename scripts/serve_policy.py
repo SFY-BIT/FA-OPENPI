@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 
+import jax
 import jax.numpy as jnp
 import tyro
 
@@ -246,8 +247,17 @@ class EefActionPolicyWrapper(_policy.Policy):
     def __init__(self, policy: _policy.Policy, *, tool_extension: float = 0.211):
         self._inner = policy
         self._tool_extension = tool_extension
-        # metadata 透传
-        self.metadata = policy.metadata
+        # metadata 透传（用 _metadata 内部字段，metadata 是只读 property）
+        self._metadata = policy.metadata
+        # JIT 编译 IK（非 jit 单次 1.4s, jit 后 ~3ms）——首次调用时编译。
+        from openpi.models import piper_fk_jax as _jfk
+        self._eef_ik_jit = jax.jit(
+            lambda t, q: _jfk.eef_ik(t, q, tool_extension=tool_extension)
+        )
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
 
     def infer(self, obs: dict, *, noise=None) -> dict:
         import numpy as np
@@ -279,28 +289,30 @@ class EefActionPolicyWrapper(_policy.Policy):
         if "actions" in result:
             actions = np.asarray(result["actions"], dtype=np.float32)  # [30, 7]
             eef_actions = actions[..., :6]  # [30, 6]
-            # 从当前关节出发迭代 IK（保证解连续）
+            # 从当前关节出发迭代 IK（保证解连续）。jit 编译后 ~3ms/步。
             q_cur = joints
             ik_joints = []
+            n_fail = 0
+            max_err = 0.0
             for h in range(eef_actions.shape[0]):
                 target = eef_actions[h]
-                q_sol, converged, err = _jfk.eef_ik(
+                q_sol, converged, err = self._eef_ik_jit(
                     jnp.asarray(target, dtype=jnp.float32),
                     jnp.asarray(q_cur, dtype=jnp.float32),
-                    tool_extension=self._tool_extension,
                 )
                 q_cur = np.asarray(q_sol, dtype=np.float32)
                 ik_joints.append(q_cur)
-                if h < 2 or not bool(np.asarray(converged)):
-                    logging.info(
-                        "[EEF-mode] IK h=%d converged=%s err=%.5f q=%s",
-                        h, bool(np.asarray(converged)),
-                        float(np.asarray(np.linalg.norm(err))),
-                        np.round(q_cur, 4).tolist(),
-                    )
+                err_norm = float(np.asarray(np.linalg.norm(err)))
+                max_err = max(max_err, err_norm)
+                if not bool(np.asarray(converged)):
+                    n_fail += 1
             ik_joints = np.stack(ik_joints)  # [30, 6]
             # 保持 gripper 列不变
             result["actions"] = np.concatenate([ik_joints, actions[..., 6:7]], axis=-1)
+            logging.info(
+                "[EEF-mode] IK done: %d/30 not-converged, max_err=%.5f",
+                n_fail, max_err,
+            )
         return result
 
     def reset(self) -> None:
