@@ -496,8 +496,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                 # Single-arm default: 7 joints delta + 1 gripper absolute.
                 # Dual-arm (action_dim=14): 6 joints delta + 1 grip absolute per arm,
                 # matching the Aloha reference config make_bool_mask(6, -1, 6, -1).
-                if self.action_dim == 8:
-                    delta_action_mask = _transforms.make_bool_mask(7, -1)
+                if self.action_dim in (7, 8):
+                    delta_action_mask = _transforms.make_bool_mask(self.action_dim - 1, -1)
                 else:
                     delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
             data_transforms = data_transforms.push(
