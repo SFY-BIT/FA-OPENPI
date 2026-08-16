@@ -254,30 +254,45 @@ class EefActionPolicyWrapper(_policy.Policy):
         self._eef_ik_jit = jax.jit(
             lambda t, q: _jfk.eef_ik(t, q, tool_extension=tool_extension)
         )
+        # 上一帧 EEF rpy（用于输入 unwrap 连续化，与训练数据集转换一致）。
+        # 训练时 state/action 的 rpy 被逐帧 ±2π 展开消除假跳变；推理时
+        # 单帧 FK 也要用同一基准延续（否则输入 rpy 跳到不连续分支）。
+        self._prev_rpy: np.ndarray | None = None
 
     @property
     def metadata(self) -> dict:
         return self._metadata
 
+    def _fk_with_unwrap(self, joints: np.ndarray) -> np.ndarray:
+        """joint [6] → EEF [6] (xyz + rpy)，rpy 相对上一帧 unwrap。"""
+        import numpy as np
+        from openpi.models import piper_fk_jax as _jfk
+        T = np.asarray(_jfk.fk(jnp.asarray(joints, dtype=jnp.float32), self._tool_extension))
+        xyz = T[:3, 3]
+        R = T[:3, :3]
+        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+        rpy = np.array([
+            np.arctan2(R[2, 1], R[2, 2]),
+            np.arctan2(-R[2, 0], sy),
+            np.arctan2(R[1, 0], R[0, 0]),
+        ], dtype=np.float32)
+        if self._prev_rpy is not None:
+            diff = rpy - self._prev_rpy
+            rpy -= np.round(diff / (2.0 * np.pi)) * (2.0 * np.pi)
+        self._prev_rpy = rpy.copy()
+        return np.concatenate([xyz, rpy]).astype(np.float32)
+
     def infer(self, obs: dict, *, noise=None) -> dict:
         import numpy as np
         from openpi.models import piper_fk_jax as _jfk
 
-        # ── 输入转换: joint state [7] -> EEF state [7] (前 6 维 FK) ──
+        # ── 输入转换: joint state [7] -> EEF state [7] (前 6 维 FK + unwrap) ──
         obs = dict(obs)
         state = np.asarray(obs["observation/state"], dtype=np.float32)
         if state.ndim > 1:
             state = state[0]
         joints = state[:6]
-        # 单帧 FK (jit 稳定版, 与数据集转换一致)
-        T = np.asarray(_jfk.fk(jnp.asarray(joints, dtype=jnp.float32), self._tool_extension))
-        xyz = T[:3, 3]
-        R = T[:3, :3]
-        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-        eef6 = np.concatenate([
-            xyz,
-            [np.arctan2(R[2, 1], R[2, 2]), np.arctan2(-R[2, 0], sy), np.arctan2(R[1, 0], R[0, 0])],
-        ]).astype(np.float32)
+        eef6 = self._fk_with_unwrap(joints)
         # 保持 gripper (index 6) 不变
         new_state = np.concatenate([eef6, state[6:7]]).astype(np.float32)
         obs["observation/state"] = new_state
@@ -317,6 +332,8 @@ class EefActionPolicyWrapper(_policy.Policy):
 
     def reset(self) -> None:
         self._inner.reset()
+        # 清空 unwrap 状态（下一 episode 重新起基准）
+        self._prev_rpy = None
 
 
 def create_policy(args: Args) -> _policy.Policy:
