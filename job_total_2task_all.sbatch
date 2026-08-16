@@ -22,9 +22,13 @@ export PYTHONWARNINGS=ignore
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 # ============================================================
-# total_2task 完整训练链（单卡串行+并行编排）
+# total_2task 训练链（单卡编排）
 #   阶段 1: eef_joint 恢复 (32000 → 40000, bs=16, 独占)
-#   阶段 2: 纯 pi05 joint + eef 并行 (各 bs=16, 45% 显存)
+#   阶段 2: 纯 pi05 joint 训练 (resume 完成后并行启动)
+#   ⚠️ EEF plain (pi05_plain_total_task_eef_remote) 暂缓:
+#       EEF 数据集 total_2task_flexiv_eef_noforce 为旧版 (含万向节锁
+#       假跳变), 新版 unwrapped 数据集重处理后需重算 norm_stats 并更新
+#       config repo_id 才能启用。
 # ============================================================
 
 echo "=== 远端 GPU 信息 ==="
@@ -47,13 +51,13 @@ python scripts/train.py pi05_force_total_task_eef_joint_remote \
 echo "=== [1/2] eef_joint 恢复完成 $(date) ==="
 
 ############################################################
-# 阶段 2: 纯 pi05 并行 (joint + eef)
+# 阶段 2: 纯 pi05 joint (并行)
 ############################################################
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 COMMON="--num_train_steps=40000 --save_interval=2000 --keep_period=10000 --log_interval=10 --num_workers=4"
 
-echo "=== [2/2a] pi05_plain_total_task_joint_remote (纯 pi05, joint) ==="
+echo "=== [2/2] pi05_plain_total_task_joint_remote (纯 pi05, joint 空间) ==="
 python -u scripts/train.py pi05_plain_total_task_joint_remote \
     --exp-name=plain_joint \
     --overwrite \
@@ -62,18 +66,9 @@ python -u scripts/train.py pi05_plain_total_task_joint_remote \
     2>&1 | tee logs/total_2task_all_plain_joint.log &
 P_J=$!
 
-echo "=== [2/2b] pi05_plain_total_task_eef_remote (纯 pi05, eef) ==="
-python -u scripts/train.py pi05_plain_total_task_eef_remote \
-    --exp-name=plain_eef \
-    --overwrite \
-    --batch_size=16 \
-    $COMMON \
-    2>&1 | tee logs/total_2task_all_plain_eef.log &
-P_E=$!
-
-echo "=== 纯 pi05 并行进行中: joint PID=$P_J, eef PID=$P_E ==="
+echo "=== 纯 pi05 joint 进行中: PID=$P_J ==="
 for i in $(seq 1 6); do nvidia-smi --query-gpu=memory.used --format=csv,noheader; sleep 10; done
 
-wait $P_J $P_E
-echo "=== [2/2] 纯 pi05 并行完成 $(date) ==="
+wait $P_J
+echo "=== [2/2] 纯 pi05 joint 完成 $(date) ==="
 echo "=== 全部完成 ==="
