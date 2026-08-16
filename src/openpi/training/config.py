@@ -3312,6 +3312,82 @@ _CONFIGS = [
         keep_period=10000,
         num_train_steps=40_000,
     ),
+    # ── 纯 pi05 远端版 (repo_id 指向远端数据集路径) ──
+    #   与本地版唯一区别: repo_id 用 /data/group1/junjie008/datasets/...
+    TrainConfig(
+        name="pi05_plain_total_task_joint_remote",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_ft60_noforce",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=40_000,
+    ),
+    TrainConfig(
+        name="pi05_plain_total_task_eef_remote",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef_noforce",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=True,
+            use_delta_gripper_actions=False,
+            action_dim=7,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=40_000,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

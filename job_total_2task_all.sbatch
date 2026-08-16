@@ -53,8 +53,8 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.45
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 COMMON="--num_train_steps=40000 --save_interval=2000 --keep_period=10000 --log_interval=10 --num_workers=4"
 
-echo "=== [2/2a] pi05_plain_total_task_joint (纯 pi05, joint) ==="
-python -u scripts/train.py pi05_plain_total_task_joint \
+echo "=== [2/2a] pi05_plain_total_task_joint_remote (纯 pi05, joint) ==="
+python -u scripts/train.py pi05_plain_total_task_joint_remote \
     --exp-name=plain_joint \
     --overwrite \
     --batch_size=16 \
@@ -62,8 +62,8 @@ python -u scripts/train.py pi05_plain_total_task_joint \
     2>&1 | tee logs/total_2task_all_plain_joint.log &
 P_J=$!
 
-echo "=== [2/2b] pi05_plain_total_task_eef (纯 pi05, eef) ==="
-python -u scripts/train.py pi05_plain_total_task_eef \
+echo "=== [2/2b] pi05_plain_total_task_eef_remote (纯 pi05, eef) ==="
+python -u scripts/train.py pi05_plain_total_task_eef_remote \
     --exp-name=plain_eef \
     --overwrite \
     --batch_size=16 \
