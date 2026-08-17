@@ -21,6 +21,12 @@ export WANDB_API_KEY='wandb_v1_4Mi9ldFXDiHNjARLGTCVQyX882s_U7Dy0lT1ogaWV7cWJRid6
 export PYTHONWARNINGS=ignore
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
+# ⚠️ 关键: 关闭 XLA 显存预分配 (必须在所有阶段前)。
+#   否则 JAX 启动即预分配几乎全部显存, multiprocessing spawn 的数据
+#   加载 worker 重新初始化 JAX 时 CUDA context 申请 OOM
+#   (job 405 失败根因: CUDA_ERROR_OUT_OF_MEMORY in spawn worker)。
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
 # ============================================================
 # total_2task 训练链（单卡编排）
 #   阶段 1: eef_joint 恢复 (32000 → 40000, bs=16, 独占)
