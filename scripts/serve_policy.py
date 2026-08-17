@@ -129,11 +129,15 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
-    # Action space: "joint" (default, 关节绝对位置) or "eef" (末端 6D 位姿 xyz+rpy).
+    # Action space: "joint" (default, 关节绝对位置) or "eef" (末端 EEF 位姿).
     # In EEF mode the server converts client joint obs -> EEF via FK before inference,
     # and converts model EEF actions -> joint via numerical IK after inference.
     # Requires piper_fk_jax (Piper 6-DoF, tool_extension 0.211 incl. sensor).
     action_space: ActionSpace = ActionSpace.JOINT
+    # Model action semantics in EEF mode:
+    #   "abs"   : model outputs absolute EEF pose (joint baseline / old EEF models)
+    #   "delta" : model outputs relative delta w.r.t. current state (rot6d EEF models)
+    action_rep: str = "abs"
     # Tool extension used for FK/IK when action_space=eef (default 0.211 = gripper + sensor).
     tool_extension: float = 0.211
 
@@ -235,95 +239,125 @@ def _filter_output_norm_stats(norm_stats: dict | None) -> dict | None:
 
 
 class EefActionPolicyWrapper(_policy.Policy):
-    """Wrap a joint-space policy for EEF action space (input FK, output IK).
+    """Wrap a policy for EEF action space (input FK, output IK).
 
-    输入（client 发 joint）→ FK → EEF 给模型推理
-    模型输出 EEF action → IK → joint 返回 client
+    输入（client 发 joint）→ FK → EEF rot6d 给模型推理
+    模型输出 EEF delta → 合成绝对 → IK → joint 返回 client
 
     坐标系与训练完全一致: piper_fk_jax 的 fk()/eef_ik() 都带 tool_extension
-    (0.211 = 夹爪 0.13503 + 传感器 0.076), 与数据集转换/EEF loss 同一套。
+    (0.211 = 夹爪 0.13503 + 传感器 0.076), 与数据集转换 (rot6d 版) 同一套。
+
+    支持两种模型输出语义:
+      - action_rep="abs"   : 模型输出绝对 EEF 位姿 (joint baseline 模型的
+                              joint 输出也走这里, 先 FK 成绝对)
+      - action_rep="delta" : 模型输出相对当前 state 的 delta (rot6d 版
+                              EEF 模型), 用 R_cur^T @ R_target 合成绝对
     """
 
-    def __init__(self, policy: _policy.Policy, *, tool_extension: float = 0.211):
+    def __init__(self, policy: _policy.Policy, *, tool_extension: float = 0.211,
+                 action_rep: str = "abs"):
         self._inner = policy
         self._tool_extension = tool_extension
+        self._action_rep = action_rep
         # metadata 透传（用 _metadata 内部字段，metadata 是只读 property）
         self._metadata = policy.metadata
         # JIT 编译 IK（非 jit 单次 1.4s, jit 后 ~3ms）——首次调用时编译。
         from openpi.models import piper_fk_jax as _jfk
         self._eef_ik_jit = jax.jit(
-            lambda t, q: _jfk.eef_ik(t, q, tool_extension=tool_extension)
+            lambda tp, qi, Rm: _jfk.eef_ik(tp, qi, tool_extension=tool_extension, target_R=Rm)
         )
-        # 上一帧 EEF rpy（用于输入 unwrap 连续化，与训练数据集转换一致）。
-        # 训练时 state/action 的 rpy 被逐帧 ±2π 展开消除假跳变；推理时
-        # 单帧 FK 也要用同一基准延续（否则输入 rpy 跳到不连续分支）。
-        self._prev_rpy: np.ndarray | None = None
 
     @property
     def metadata(self) -> dict:
         return self._metadata
 
-    def _fk_with_unwrap(self, joints: np.ndarray) -> np.ndarray:
-        """joint [6] → EEF [6] (xyz + rpy)，rpy 相对上一帧 unwrap。"""
+    def _fk_abs(self, joints: np.ndarray) -> np.ndarray:
+        """joint [6] → EEF 绝对位姿 [9] (xyz + rot6d)。无角度表示, 无不连续。"""
         import numpy as np
         from openpi.models import piper_fk_jax as _jfk
         T = np.asarray(_jfk.fk(jnp.asarray(joints, dtype=jnp.float32), self._tool_extension))
         xyz = T[:3, 3]
         R = T[:3, :3]
-        sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-        rpy = np.array([
-            np.arctan2(R[2, 1], R[2, 2]),
-            np.arctan2(-R[2, 0], sy),
-            np.arctan2(R[1, 0], R[0, 0]),
-        ], dtype=np.float32)
-        if self._prev_rpy is not None:
-            diff = rpy - self._prev_rpy
-            rpy -= np.round(diff / (2.0 * np.pi)) * (2.0 * np.pi)
-        self._prev_rpy = rpy.copy()
-        return np.concatenate([xyz, rpy]).astype(np.float32)
+        d6 = R[:2, :].reshape(6)  # rot6d (与训练转换一致)
+        return np.concatenate([xyz, d6]).astype(np.float32)
+
+    def _rot6d_to_R(self, d6: np.ndarray) -> np.ndarray:
+        """rot6d → 旋转矩阵 (Gram-Schmidt, 与 UMI/训练一致)。"""
+        a1 = d6[0:3]
+        a2 = d6[3:6]
+        b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+        b2 = a2 - np.dot(b1, a2) * b1
+        b2 = b2 / (np.linalg.norm(b2) + 1e-8)
+        b3 = np.cross(b1, b2)
+        return np.stack([b1, b2, b3], axis=0)
+
+    def _abs_to_rel(self, target_abs: np.ndarray, base_abs: np.ndarray) -> np.ndarray:
+        """绝对 target → 相对 base 的 delta (矩阵合成)。target/base: [9] xyz+rot6d。"""
+        d_xyz = target_abs[:3] - base_abs[:3]
+        R_base = self._rot6d_to_R(base_abs[3:9])
+        R_tgt = self._rot6d_to_R(target_abs[3:9])
+        dR = R_base.T @ R_tgt
+        return np.concatenate([d_xyz, dR[:2, :].reshape(6)]).astype(np.float32)
 
     def infer(self, obs: dict, *, noise=None) -> dict:
         import numpy as np
         from openpi.models import piper_fk_jax as _jfk
 
-        # ── 输入转换: joint state [7] -> EEF state [7] (前 6 维 FK + unwrap) ──
+        # ── 输入转换: joint state [7] -> EEF state [10] (xyz+rot6d+grip) ──
         obs = dict(obs)
         state = np.asarray(obs["observation/state"], dtype=np.float32)
         if state.ndim > 1:
             state = state[0]
         joints = state[:6]
-        eef6 = self._fk_with_unwrap(joints)
-        # 保持 gripper (index 6) 不变
-        new_state = np.concatenate([eef6, state[6:7]]).astype(np.float32)
+        eef_abs = self._fk_abs(joints)  # [9]
+        # 保持 gripper 与力维度 (force 版 state 是 [10..16], grip 在 index 9)
+        new_state = np.concatenate([eef_abs, state[6:]]).astype(np.float32)
         obs["observation/state"] = new_state
-        logging.info("[EEF-mode] FK state: %s", np.round(new_state, 4).tolist())
+        logging.info("[EEF-mode] FK state: %s", np.round(new_state[:10], 4).tolist())
 
         result = self._inner.infer(obs, noise=noise)
 
-        # ── 输出转换: EEF action [30, 7] -> joint action [30, 7] (前 6 维 IK) ──
+        # ── 输出转换: EEF delta/abs [30, 10] -> joint action [30, 7] (IK) ──
         if "actions" in result:
-            actions = np.asarray(result["actions"], dtype=np.float32)  # [30, 7]
-            eef_actions = actions[..., :6]  # [30, 6]
-            # 从当前关节出发迭代 IK（保证解连续）。jit 编译后 ~3ms/步。
+            actions = np.asarray(result["actions"], dtype=np.float32)  # [30, 10]
+            eef_delta = actions[..., :9]  # [30, 9]
+            # 从当前绝对 EEF 出发迭代 (delta) 或直接用目标 (abs)。
             q_cur = joints
+            cur_abs = eef_abs
             ik_joints = []
             n_fail = 0
             max_err = 0.0
-            for h in range(eef_actions.shape[0]):
-                target = eef_actions[h]
+            for h in range(eef_delta.shape[0]):
+                if self._action_rep == "delta":
+                    # delta: 模型输出相对当前 state 的 delta → 合成绝对
+                    d = eef_delta[h]
+                    target = np.zeros(9, dtype=np.float32)
+                    target[:3] = cur_abs[:3] + d[:3]
+                    R_cur = self._rot6d_to_R(cur_abs[3:9])
+                    dR = self._rot6d_to_R(d[3:9])
+                    target[3:9] = (R_cur @ dR)[:2, :].reshape(6)
+                else:
+                    # abs: 模型输出绝对 EEF 位姿 (或 joint 输出 FK 成绝对)
+                    target = eef_delta[h]
+                # IK: 传 [xyz] + target_R (rot6d→R), 完全绕开 rpy。
+                R_tgt = self._rot6d_to_R(target[3:9])
                 q_sol, converged, err = self._eef_ik_jit(
-                    jnp.asarray(target, dtype=jnp.float32),
+                    jnp.asarray(target[:3], dtype=jnp.float32),
                     jnp.asarray(q_cur, dtype=jnp.float32),
+                    jnp.asarray(R_tgt, dtype=jnp.float32),
                 )
                 q_cur = np.asarray(q_sol, dtype=np.float32)
+                if self._action_rep == "delta":
+                    # 更新当前绝对位姿 (合成)
+                    cur_abs = target
                 ik_joints.append(q_cur)
                 err_norm = float(np.asarray(np.linalg.norm(err)))
                 max_err = max(max_err, err_norm)
                 if not bool(np.asarray(converged)):
                     n_fail += 1
             ik_joints = np.stack(ik_joints)  # [30, 6]
-            # 保持 gripper 列不变
-            result["actions"] = np.concatenate([ik_joints, actions[..., 6:7]], axis=-1)
+            # 保持 gripper 列不变 (index 9)
+            result["actions"] = np.concatenate([ik_joints, actions[..., 9:10]], axis=-1)
             logging.info(
                 "[EEF-mode] IK done: %d/30 not-converged, max_err=%.5f",
                 n_fail, max_err,
@@ -332,8 +366,6 @@ class EefActionPolicyWrapper(_policy.Policy):
 
     def reset(self) -> None:
         self._inner.reset()
-        # 清空 unwrap 状态（下一 episode 重新起基准）
-        self._prev_rpy = None
 
 
 def create_policy(args: Args) -> _policy.Policy:
@@ -354,8 +386,13 @@ def create_policy(args: Args) -> _policy.Policy:
 
     # EEF action space: wrap with FK/IK conversion.
     if args.action_space == ActionSpace.EEF:
-        logging.info("EEF action space enabled (FK input / IK output, tool_ext=%.3f)", args.tool_extension)
-        return EefActionPolicyWrapper(base_policy, tool_extension=args.tool_extension)
+        logging.info("EEF action space enabled (FK input / IK output, tool_ext=%.3f, rep=%s)",
+                     args.tool_extension, args.action_rep)
+        return EefActionPolicyWrapper(
+            base_policy,
+            tool_extension=args.tool_extension,
+            action_rep=args.action_rep,
+        )
     return base_policy
 
 

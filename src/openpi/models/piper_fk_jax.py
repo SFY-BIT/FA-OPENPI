@@ -197,6 +197,7 @@ def eef_ik(
     max_iter: int = 80,
     tol: float = 1e-4,
     lr: float = 1.0,
+    target_R: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """数值 IK: EEF 位姿 [xyz(3), rpy(3)] → 关节角 [6]。
 
@@ -204,18 +205,21 @@ def eef_ik(
     （Piper 数据 roll 常接近 ±π，欧拉角雅可比会病态导致 dq 爆炸 → 机械臂乱飞）。
 
     Args:
-        target_pose: [6] 目标 EEF 位姿 [x, y, z, roll, pitch, yaw]
+        target_pose: [6] 目标 EEF 位姿 [x, y, z, roll, pitch, yaw]。若
+            target_R 提供, 只用前 3 维 (xyz), R 直接取 target_R。
         q_init: [6] 初始关节角（建议用当前关节）
         tool_extension: 工具延伸（默认 0.211）
         max_iter: 最大迭代次数
         tol: 收敛阈值（位置 m + 旋转 rad 混合）
         lr: 步长
+        target_R: [3,3] 可选, 目标旋转矩阵 (rot6d 版 EEF 用, 避免 rpy 表示)。
+            提供时忽略 target_pose[3:]。
 
     Returns:
         (q_sol, converged, err): 关节解 / 收敛标志 / 最终误差 [6]
     """
     target_xyz = target_pose[:3]
-    target_R = _rot_rpy(target_pose[3:])
+    target_R = _rot_rpy(target_pose[3:]) if target_R is None else target_R
     lam = 1e-3
 
     def _step(q: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
