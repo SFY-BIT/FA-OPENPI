@@ -134,6 +134,7 @@ python scripts/serve_policy.py \
 | 症状 | 原因/解决 |
 |---|---|
 | `NameError: np is not defined` (serve_policy) | 已修复(2026-08-18): 顶部加 `import numpy as np`（类定义注解在 import 时求值） |
+| **EEF 模型冲天/乱飞（chunk 开高严重）** | 已修复(d839622): 旧版对 30 步 chunk 链式复合 delta（cur=target 累加），数据集 delta 含控制超前量 → 复合无界漂移（h29 达 3.16rad）。现改为**单基准**：每步以推理时刻当前 EEF 位姿为基座合成（与 UMI/GR00T/openpi AbsoluteActions 一致），h29 偏差降至 0.054rad。模型权重与 IK 均无问题 |
 | `--policy.config` Unrecognized | 参数顺序: `policy:checkpoint` 放 `--policy.*` 前面 |
 | norm_stats 找不到 `/data/group1/...` | 预期，`--norm-stats-dir` 指本地数据集根 |
 | EEF 模式 IK err~0.001 | 正常（0.001 rad ≈ 0.06°，物理可忽略） |
