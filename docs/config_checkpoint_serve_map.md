@@ -38,7 +38,7 @@
 checkpoint 前缀: `/mnt/hdd/sfy/FA-openpi/checkpoints/`
 
 > 训练中（未出最终 ckpt）: **EEF v2 修复轮** `eef_v2_plain` / `eef_v2_force`
-> （sbatch: `job_eef_v2_plain.sbatch` / `job_eef_v2_force.sbatch`，2026-08-18 起，双卡并行，各 40k 步，
+> （sbatch: `job_eef_v2_parallel.sbatch`，2026-08-18 起，**单卡并行**（sbatch 内两进程各 45% 显存），bs=8 各 40k 步，
 > config: `pi05_plain_total_task_eef_v2_remote` / `pi05_force_total_task_eef_v2_remote`，
 > 出 ckpt 后登记步数并复制 §2 ⑤/⑥ 指令改 `--policy.dir` 即可）。
 > 回归时期的 `total_eef/39999`（旧 config `pi05_force_total_task_eef_only_remote`，rot6d 改版前）

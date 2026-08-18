@@ -3417,6 +3417,8 @@ _CONFIGS = [
     #   v2: 数据集存绝对 EEF [xyz(3), rot6d(6), grip(1)], 训练时
     #       EefDeltaActions 相对 chunk 基准 (当前帧 state) 合成 delta。
     #   norm_stats: 本地 compute_norm_stats_local.py 预计算, asset_id=绝对路径加载。
+    #   训练: 单卡并行 (job_eef_v2_parallel.sbatch, 两 v2 各 45% 显存并行),
+    #        sbatch 命令行 --batch_size=8 覆盖此处默认 32 (与 chain 训练一致)。
     # ═───────────────────────────────────────────────────────────────────────
     TrainConfig(
         name="pi05_plain_total_task_eef_v2_remote",
