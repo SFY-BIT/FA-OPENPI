@@ -322,19 +322,24 @@ class EefActionPolicyWrapper(_policy.Policy):
         if "actions" in result:
             actions = np.asarray(result["actions"], dtype=np.float32)  # [30, 10]
             eef_delta = actions[..., :9]  # [30, 9]
-            # 从当前绝对 EEF 出发迭代 (delta) 或直接用目标 (abs)。
-            q_cur = joints
-            cur_abs = eef_abs
+            # 2026-08-18 修复: delta 模式不再链式累加!
+            # 数据集 delta[t] = action[t] - state[t] (含控制超前量, 非纯增量),
+            # 链式复合 (cur_abs=target) 会把超前量每步累进 → 30-chunk 复合
+            # ~3 rad 关节漂移 → 真机冲飞 (Pump_bottle_eef 事故)。
+            # 与 UMI/GR00T/openpi AbsoluteActions 一致: 每步都以推理时刻
+            # 的当前位姿 eef_abs 为唯一基准 (单基准, 有界), IK 热启动也用
+            # 当前关节 (邻域解分支)。
             ik_joints = []
             n_fail = 0
             max_err = 0.0
             for h in range(eef_delta.shape[0]):
                 if self._action_rep == "delta":
                     # delta: 模型输出相对当前 state 的 delta → 合成绝对
+                    # (每步基于 eef_abs, 不更新基准)
                     d = eef_delta[h]
                     target = np.zeros(9, dtype=np.float32)
-                    target[:3] = cur_abs[:3] + d[:3]
-                    R_cur = self._rot6d_to_R(cur_abs[3:9])
+                    target[:3] = eef_abs[:3] + d[:3]
+                    R_cur = self._rot6d_to_R(eef_abs[3:9])
                     dR = self._rot6d_to_R(d[3:9])
                     target[3:9] = (R_cur @ dR)[:2, :].reshape(6)
                 else:
@@ -344,13 +349,10 @@ class EefActionPolicyWrapper(_policy.Policy):
                 R_tgt = self._rot6d_to_R(target[3:9])
                 q_sol, converged, err = self._eef_ik_jit(
                     jnp.asarray(target[:3], dtype=jnp.float32),
-                    jnp.asarray(q_cur, dtype=jnp.float32),
+                    jnp.asarray(joints, dtype=jnp.float32),
                     jnp.asarray(R_tgt, dtype=jnp.float32),
                 )
                 q_cur = np.asarray(q_sol, dtype=np.float32)
-                if self._action_rep == "delta":
-                    # 更新当前绝对位姿 (合成)
-                    cur_abs = target
                 ik_joints.append(q_cur)
                 err_norm = float(np.asarray(np.linalg.norm(err)))
                 max_err = max(max_err, err_norm)
