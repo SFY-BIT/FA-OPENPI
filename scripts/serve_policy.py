@@ -141,6 +141,11 @@ class Args:
     action_rep: str = "abs"
     # Tool extension used for FK/IK when action_space=eef (default 0.211 = gripper + sensor).
     tool_extension: float = 0.211
+    # Delta-goal extrapolation rate inside the action chunk (EEF delta mode only).
+    # 遥操作数据里 command 领先 state 一个 gap, 机械臂以 alpha/帧吃掉 gap
+    # (30fps 拟合: alpha≈0.098)。demo 回放语义: target(h)=base+d*(1+alpha*h),
+    # 30-chunk 外推 ~3.8×gap。0 = 不外推 (目标恒定, 爬行)。经验范围 0.05-0.20。
+    gap_rate: float = 0.0
 
 
 # Default checkpoints that should be used for each environment.
@@ -256,10 +261,11 @@ class EefActionPolicyWrapper(_policy.Policy):
     """
 
     def __init__(self, policy: _policy.Policy, *, tool_extension: float = 0.211,
-                 action_rep: str = "abs"):
+                 action_rep: str = "abs", gap_rate: float = 0.0):
         self._inner = policy
         self._tool_extension = tool_extension
         self._action_rep = action_rep
+        self._gap_rate = gap_rate  # chunk 内目标外推速率 (见 docstring)
         # metadata 透传（用 _metadata 内部字段，metadata 是只读 property）
         self._metadata = policy.metadata
         # JIT 编译 IK（非 jit 单次 1.4s, jit 后 ~3ms）——首次调用时编译。
@@ -329,6 +335,14 @@ class EefActionPolicyWrapper(_policy.Policy):
             # 与 UMI/GR00T/openpi AbsoluteActions 一致: 每步都以推理时刻
             # 的当前位姿 eef_abs 为唯一基准 (单基准, 有界), IK 热启动也用
             # 当前关节 (邻域解分支)。
+            #
+            # 2026-08-18 补充: 单基准后机械臂爬行 —— 遥操作记录里 command
+            # 领先 state 一个 gap, 机械臂以 alpha≈0.098/帧吃掉 gap (30fps,
+            # 100 集运动段中位最小二乘)。demo 回放需要按同速率逐帧推进目标:
+            #   target(h) = base + d · (h+1)·alpha ... 一次推理的 chunk 内
+            # 目标随 h 前移, 30 步外推 1+alpha·29 ≈ 3.8×gap ≈ 7.7cm。
+            # --gap-rate=0 关闭外推 (目标恒定), >0 启用。旋转按轴角缩放。
+            rate = self._gap_rate
             ik_joints = []
             n_fail = 0
             max_err = 0.0
@@ -337,10 +351,22 @@ class EefActionPolicyWrapper(_policy.Policy):
                     # delta: 模型输出相对当前 state 的 delta → 合成绝对
                     # (每步基于 eef_abs, 不更新基准)
                     d = eef_delta[h]
+                    scale = 1.0 + rate * h  # chunk 内目标外推
                     target = np.zeros(9, dtype=np.float32)
-                    target[:3] = eef_abs[:3] + d[:3]
+                    target[:3] = eef_abs[:3] + d[:3] * scale
                     R_cur = self._rot6d_to_R(eef_abs[3:9])
                     dR = self._rot6d_to_R(d[3:9])
+                    if rate > 0.0 and abs(scale - 1.0) > 1e-9:
+                        # 轴角缩放旋转 delta (精确比例, 不走欧拉角)
+                        ang = np.arccos(np.clip((np.trace(dR) - 1.0) / 2.0, -1.0, 1.0))
+                        if ang > 1e-6:
+                            #Rodrigues: 用旋转矩阵自身幂实现 (matmul 迭代不需
+                            # 要, 直接 skew 指数)
+                            w = np.array([dR[2,1]-dR[1,2], dR[0,2]-dR[2,0], dR[1,0]-dR[0,1]])
+                            w = w / (np.linalg.norm(w) + 1e-12) * (ang * scale)
+                            K = np.array([[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]])
+                            dR = np.eye(3) + np.sin(np.linalg.norm(w))/np.linalg.norm(w)*K \
+                                 + (1-np.cos(np.linalg.norm(w)))/np.linalg.norm(w)**2 * (K @ K)
                     target[3:9] = (R_cur @ dR)[:2, :].reshape(6)
                 else:
                     # abs: 模型输出绝对 EEF 位姿 (或 joint 输出 FK 成绝对)
@@ -389,12 +415,13 @@ def create_policy(args: Args) -> _policy.Policy:
 
     # EEF action space: wrap with FK/IK conversion.
     if args.action_space == ActionSpace.EEF:
-        logging.info("EEF action space enabled (FK input / IK output, tool_ext=%.3f, rep=%s)",
-                     args.tool_extension, args.action_rep)
+        logging.info("EEF action space enabled (FK input / IK output, tool_ext=%.3f, rep=%s, gap_rate=%.3f)",
+                     args.tool_extension, args.action_rep, args.gap_rate)
         return EefActionPolicyWrapper(
             base_policy,
             tool_extension=args.tool_extension,
             action_rep=args.action_rep,
+            gap_rate=args.gap_rate,
         )
     return base_policy
 
