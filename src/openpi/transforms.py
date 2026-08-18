@@ -246,6 +246,89 @@ class AbsoluteActions(DataTransformFn):
         return data
 
 
+# ═══════════════ EEF rot6d 动作空间 (v2, 与 joint DeltaActions 严格平行) ═══════════════
+# 布局: [xyz(3), rot6d(6), grip(1)] (+ 可选尾部维度如 force, 不动)。
+# 数据集 parquet 存**绝对** EEF 位姿 (UMI/GR00T 语义); 训练时由这里
+# 相对 chunk 基准 (当前帧 state) 合成 delta — chunk 内保留完整轨迹 ramp。
+# (v1 教训: 数据集侧逐帧 delta 会把 30 步轨迹压成常量 gap → 部署爬行。)
+# rot6d 不是线性空间, 不能像关节那样直接做差: 旋转必须矩阵合成。
+
+
+def _rot6d_to_mat_batch(d6: np.ndarray) -> np.ndarray:
+    """[..., 6] -> [..., 3, 3]。rot6d = R 的前两行 (row-major), Gram-Schmidt 正交化。"""
+    a1 = d6[..., 0:3].astype(np.float64)
+    a2 = d6[..., 3:6].astype(np.float64)
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-2)  # 行向量堆叠
+
+
+def _mat_to_rot6d_batch(R: np.ndarray) -> np.ndarray:
+    """[..., 3, 3] -> [..., 6]。取前两行展平 (row-major)。"""
+    return R[..., :2, :].reshape(*R.shape[:-2], 6)
+
+
+@dataclasses.dataclass(frozen=True)
+class EefDeltaActions(DataTransformFn):
+    """绝对 EEF actions → 相对当前帧 state 的 delta (chunk 单基准)。
+
+    xyz   : 线性差, chunk 全帧减同一 state (与 joint DeltaActions 同构)
+    rot6d : R_delta = R_state^T @ R_action, 再编码回 rot6d (几何唯一合法 delta)
+    grip(第9维)及之后的维度: 绝对, 不动 (由 config mask 决定哪些位参与)
+
+    与 make_bool_mask(9, -1) 配用: mask 标记前 9 维做 delta、grip 绝对。
+    """
+
+    mask: Sequence[bool] | None  # 保留 API 对称; 实际语义固定 [xyz|rot6d] 9 维 delta
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        state = np.array(data["state"], copy=False)     # [..., 10(+)]
+        actions = np.array(data["actions"], copy=True)  # [..., T, 10(+)]
+
+        # xyz: chunk 单基准线性差 (state 广播到每个动作帧)
+        actions[..., 0:3] -= np.expand_dims(state[..., 0:3], axis=-2)
+
+        # rot6d: R_delta = R_state^T @ R_action (批量广播, 无循环)
+        Rs = _rot6d_to_mat_batch(state[..., 3:9])                       # [..., 3, 3]
+        Ra = _rot6d_to_mat_batch(actions[..., 3:9])                     # [..., T, 3, 3]
+        Rd = np.swapaxes(np.expand_dims(Rs, axis=-3), axis1=-1, axis2=-2) @ Ra
+        actions[..., 3:9] = _mat_to_rot6d_batch(Rd).astype(actions.dtype)
+
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class EefAbsoluteActions(DataTransformFn):
+    """EefDeltaActions 的逆: delta actions + 当前 state → 绝对 EEF actions。"""
+
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        state = np.array(data["state"], copy=False)
+        actions = np.array(data["actions"], copy=True)
+
+        # xyz
+        actions[..., 0:3] += np.expand_dims(state[..., 0:3], axis=-2)
+
+        # rot6d: R_action = R_state @ R_delta
+        Rs = _rot6d_to_mat_batch(state[..., 3:9])
+        Rd = _rot6d_to_mat_batch(actions[..., 3:9])
+        Ra = np.expand_dims(Rs, axis=-3) @ Rd
+        actions[..., 3:9] = _mat_to_rot6d_batch(Ra).astype(actions.dtype)
+
+        data["actions"] = actions
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class MaskStateActionDims(DataTransformFn):
     """Masks selected state/action dimensions to fixed constants."""

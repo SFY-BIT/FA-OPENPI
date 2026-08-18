@@ -8,10 +8,17 @@
 ═══════════════════════════════════════════════════════════════════════════════
 表示 (rot6d, 参照 UMI / NVIDIA GR00T / Diffusion Policy):
   state   = [xyz(3), rot6d(6), grip(1)]        : 绝对 EEF 位姿 (无万向锁)
-  action  = [d_xyz(3), d_rot6d(6), grip(1)]    : 相对 base 的 delta (矩阵合成)
-    d_xyz    = xyz_target - xyz_base                       (位置线性差)
-    d_rot6d  = rot6d( R_base^T @ R_target )                (旋转矩阵合成)
-  其中 base = 当前帧 (chunk 首帧, 即训练时 delta 化的 base)。
+  action  (--absolute, v2 修复版, UMI/GR00T 语义):
+             [xyz(3), rot6d(6), grip(1)]  绝对 EEF 位姿。
+             delta 不在这里做! 由训练侧 EefDeltaActions 相对 chunk 基准
+             (当前帧 state) 合成 — 与 joint 版 DeltaActions 严格平行,
+             chunk 内保留完整轨迹 ramp。
+  action (默认, v1 旧版, 已废弃):
+             [d_xyz(3), d_rot6d(6), grip(1)]  相对**同帧** state 的逐帧 delta。
+             ⚠️ 教训: 遥操作记录里 command 领先 state 一个固定 gap,
+             逐帧做差把 30 步轨迹压成常量 gap → 模型学不到未来轨迹 →
+             部署爬行。仅保留作对照, 新训练一律用 --absolute。
+
   rot6d 是 R 的前两行展平 (row-major), 连续无奇点, 与 UMI 的
   mat_to_rot6d / rot6d_to_mat 完全一致。
 
@@ -21,20 +28,23 @@
   双表示族选择做 delta 需共享基准。rot6d 是连续最小表示, 全球无奇点,
   无需任何 unwrap/滤波/sgn 分段 hack。
 
-用法:
+用法 (v2, 推荐):
   python convert_dataset_to_eef.py \
-      --input /mnt/hdd/sfy/datasets/total_2task_flexiv_ft60 \
-      --output /mnt/hdd/sfy/datasets/total_2task_flexiv_eef_rot6d \
-      --tool-extension 0.211
+      --input /mnt/hdd/sfy/datasets/total_2task_flexiv_ft60_noforce \
+      --output /mnt/hdd/sfy/datasets/total_2task_flexiv_eef_abs_noforce \
+      --tool-extension 0.211 --absolute
 
 注意:
   - state 前 6 维: 关节 → EEF xyz+rot6d (FK)
   - action 前 6 维: 绝对关节 → 绝对 EEF 位姿 (FK), delta 由训练侧矩阵合成
   - gripper (index 6) 不变
   - 力/力矩维度 (state index 7-12, 变为 index 10-15) 不变
+  - --absolute 时 meta/info.json 的 features 同步更新 (EEF names + shape),
+    并删除复制的旧 norm_stats.json (维度含义已变, 必须重算)
   - 生成新数据集, 不修改原数据集
 """
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -50,6 +60,14 @@ from openpi.models import piper_fk_jax as jfk
 # 前 6 维 = 关节角, index 6 = gripper
 JOINT_DIMS = slice(0, 6)
 GRIPPER_DIM = 6
+
+# meta features 的 EEF names (10 维: xyz + rot6d + grip; state 可再追加 force 6 维)
+EEF_ACTION_NAMES = [
+    "eef_x", "eef_y", "eef_z",
+    "rot6d_1", "rot6d_2", "rot6d_3", "rot6d_4", "rot6d_5", "rot6d_6",
+    "gripper",
+]
+EEF_FORCE_NAMES = ["force_Fx", "force_Fy", "force_Fz", "force_Tx", "force_Ty", "force_Tz"]
 
 
 # JIT 编译的单帧 FK（避免 fk_batch 的 batch 依赖 + 避免非 jit 的 Python 开销）
@@ -120,11 +138,12 @@ def make_relative_delta(state_eef: np.ndarray, action_eef: np.ndarray) -> np.nda
     return rel.astype(np.float32)
 
 
-def convert_episode(ep_file: Path, out_file: Path, tool_extension: float) -> None:
+def convert_episode(ep_file: Path, out_file: Path, tool_extension: float, absolute: bool = False) -> None:
     """转换单个 episode parquet: state 和 action 前 6 维都 FK 成 EEF rot6d。
 
     state  = [xyz(3), rot6d(6), grip(1)]   绝对位姿 (观测)
-    action = [xyz(3), rot6d(6), grip(1)]   相对 state 的 delta (矩阵合成)
+    action (--absolute=True): [xyz(3), rot6d(6), grip(1)]  绝对 EEF 位姿 (v2, UMI/GR00T 语义)
+    action (--absolute=False, v1 已废弃): 相对同帧 state 的逐帧 delta
     剩余维度 (力/扭等) 原样保留, 整体后移。
     """
     t = pq.read_table(ep_file)
@@ -138,10 +157,16 @@ def convert_episode(ep_file: Path, out_file: Path, tool_extension: float) -> Non
     eef_states = joints_to_eef_abs_batch(states[:, JOINT_DIMS], tool_extension)  # [N, 9]
     new_states = np.concatenate([eef_states, states[:, GRIPPER_DIM:]], axis=1).astype(np.float32)
 
-    # ── action: [6 关节 + grip] → 相对 state 的 delta [xyz+rot6d + grip] ──
+    # ── action: [6 关节 + grip] → ??? [xyz+rot6d + grip] ──
     eef_actions = joints_to_eef_abs_batch(actions[:, JOINT_DIMS], tool_extension)   # [N, 9]
-    rel_delta = make_relative_delta(eef_states, eef_actions)                        # [N, 9]
-    new_actions = np.concatenate([rel_delta, actions[:, GRIPPER_DIM:]], axis=1).astype(np.float32)
+    if absolute:
+        # v2: 存绝对 EEF 位姿。delta 由训练侧 EefDeltaActions 相对 chunk 基准合成,
+        # chunk 内保留完整轨迹 ramp (修复 v1 逐帧 delta 压扁轨迹的爬行根因)。
+        act_part = eef_actions
+    else:
+        # v1 (已废弃): 相对同帧 state 的逐帧 delta, 仅保留作对照。
+        act_part = make_relative_delta(eef_states, eef_actions)
+    new_actions = np.concatenate([act_part, actions[:, GRIPPER_DIM:]], axis=1).astype(np.float32)
 
     # ── 写回 ──
     df["observation.state"] = list(new_states)
@@ -151,11 +176,43 @@ def convert_episode(ep_file: Path, out_file: Path, tool_extension: float) -> Non
     pq.write_table(new_t, out_file)
 
 
+def patch_meta_features(meta_dir: Path, absolute: bool) -> None:
+    """修正 meta/info.json 的 features: state/action 语义变为 EEF。
+
+    v1 转换只复制 meta 不更新 (action names 还是 main_joint_*, shape 7),
+    造成 meta 与 parquet 实际内容 (10 维 EEF) 不一致。这里统一修正:
+      - action: shape [10], names = eef_x..rot6d_6/gripper (绝对或 delta 语义由参数决定)
+      - observation.state: shape [10] (无 force 源) 或 [16] (ft60 源), names 同步
+    其余 features (图像/wrench_history/时间戳等) 不动。
+    """
+    info_path = meta_dir / "info.json"
+    info = json.loads(info_path.read_text())
+    feats = info.get("features", {})
+
+    feats["action"]["shape"] = [10]
+    feats["action"]["names"] = list(EEF_ACTION_NAMES)
+
+    st = feats.get("observation.state")
+    if st is not None:
+        old_dim = st.get("shape", [7])[0]
+        has_force = old_dim >= 13
+        st["shape"] = [16] if has_force else [10]
+        st["names"] = list(EEF_ACTION_NAMES) + (EEF_FORCE_NAMES if has_force else [])
+
+    info_path.write_text(json.dumps(info, indent=2))
+    tag = "absolute EEF" if absolute else "delta EEF (v1 legacy)"
+    print(f"meta patched: {info_path} (action→10 [{tag}], state→{feats['observation.state']['shape'][0]})")
+
+
 def main():
     p = argparse.ArgumentParser(description="Convert joint-state/action dataset to EEF rot6d dataset")
     p.add_argument("--input", required=True, help="输入数据集目录 (LeRobot)")
     p.add_argument("--output", required=True, help="输出数据集目录 (新数据集)")
     p.add_argument("--tool-extension", type=float, default=0.211, help="工具延伸长度 (m)")
+    p.add_argument(
+        "--absolute", action="store_true",
+        help="v2: action 存绝对 EEF 位姿 (delta 由训练侧合成)。不加则 v1 逐帧 delta (已废弃)",
+    )
     args = p.parse_args()
 
     in_dir = Path(args.input)
@@ -179,15 +236,23 @@ def main():
         out_file = out_dir / rel
         print(f"converting {rel} ...", end=" ", flush=True)
         try:
-            convert_episode(ep_file, out_file, args.tool_extension)
+            convert_episode(ep_file, out_file, args.tool_extension, absolute=args.absolute)
             print("done")
         except Exception as e:
             print(f"SKIP (传输不完整或损坏): {e}")
 
-    # 若存在 norm_stats, 提示需要重新计算
-    if (in_dir / "norm_stats.json").exists():
-        print("\n⚠️ norm_stats.json 已复制, 但 state/action 维度含义已变 (EEF 位姿).")
-        print("   训练前需用 compute_norm_stats 重新计算!")
+    # 修正 meta/info.json: features 与 parquet 实际维度/语义对齐
+    if (out_dir / "meta").is_dir():
+        patch_meta_features(out_dir / "meta", absolute=args.absolute)
+
+    # 旧 norm_stats 维度含义已变, 必须删除 (训练前重算)
+    stale_norm = out_dir / "norm_stats.json"
+    if stale_norm.exists():
+        stale_norm.unlink()
+        print("removed stale norm_stats.json (维度含义已变, 训练前必须重算)")
+
+    if not args.absolute:
+        print("\n⚠️ 未加 --absolute: 生成的是 v1 逐帧 delta 数据集 (已知压扁轨迹问题, 仅供对照)!")
 
     print(f"\n完成: {out_dir}")
 

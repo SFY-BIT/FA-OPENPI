@@ -382,6 +382,12 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     prompt_key: str = "prompt"
     use_delta_joint_actions: bool = True
     use_delta_gripper_actions: bool = False  # If True, grip (dim 6) also converted to delta
+    # EEF rot6d delta (v2): dataset stores ABSOLUTE EEF pose actions
+    # [xyz(3), rot6d(6), grip(1)] (+ optional force in state). Delta is composed
+    # at TRAIN time against the chunk base (current state) — xyz linear diff,
+    # rotation by matrix composition R_state^T @ R_action (see transforms.EefDeltaActions).
+    # Mutually exclusive with use_delta_joint_actions (set that one False).
+    use_eef_delta_actions: bool = False
     use_force_data: bool = False  # If True, concat wrist_force + wrist_torque into state
     predict_force: bool = False  # If True, also predict next-frame force (13-dim output)
     # If True, force/torque is already stored inside observation.state (e.g. 13-dim
@@ -475,6 +481,21 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             data_transforms = _transforms.Group(
                 inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
                 outputs=[piper_policy.PiperOutputs(action_dim=self.action_dim)],
+            )
+        if self.use_eef_delta_actions and self.use_delta_joint_actions:
+            raise ValueError(
+                "use_eef_delta_actions and use_delta_joint_actions are mutually exclusive "
+                "(EEF rot6d datasets store absolute pose actions; joint datasets store "
+                "absolute joint actions — pick the one matching the dataset)."
+            )
+        if self.use_eef_delta_actions:
+            # v2 EEF rot6d: actions [xyz(3), rot6d(6), grip(1)] absolute in parquet.
+            # Delta composed HERE against the chunk base (current state):
+            # xyz linear diff + rotation matrix composition; grip (dim 9) absolute.
+            eef_delta_mask = _transforms.make_bool_mask(9, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.EefDeltaActions(eef_delta_mask)],
+                outputs=[_transforms.EefAbsoluteActions(eef_delta_mask)],
             )
         if self.use_delta_joint_actions:
             if self.predict_force and not self.force_in_state:
@@ -3385,6 +3406,111 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=40_000,
+    ),
+    # ═───────────────────────────────────────────────────────────────────────
+    # EEF v2 数据集修复配置 (2026-08-18)
+    #   根因: v1 数据集 parquet 逐帧 delta 把 30 步 chunk 压成常量 gap → 部署爬行。
+    #   v2: 数据集存绝对 EEF [xyz(3), rot6d(6), grip(1)], 训练时
+    #       EefDeltaActions 相对 chunk 基准 (当前帧 state) 合成 delta。
+    #   norm_stats: 本地 compute_norm_stats_local.py 预计算, asset_id=绝对路径加载。
+    # ═───────────────────────────────────────────────────────────────────────
+    TrainConfig(
+        name="pi05_plain_total_task_eef_v2_remote",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef_abs_noforce",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=False,
+            use_eef_delta_actions=True,
+            action_dim=10,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        log_interval=10,
+        save_interval=2000,
+        keep_period=10000,
+        num_train_steps=40_000,
+    ),
+    TrainConfig(
+        name="pi05_force_total_task_eef_v2_remote",
+        model=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            use_force=True, predict_force=True,
+            control_action_dim=10,
+            force_start_idx=10,
+            force_dim=6,
+            force_history_frames=2,
+            use_ft_history=True,
+            ft_history_steps=60,
+            ft_input_dim=360,
+            ft_output_dim=256,
+            ft_encoder_type="mlp",
+            ft_num_tokens=16,
+            grad_route_mode="three_stage",
+            action_loss_weight=0.9,
+            force_loss_weight=0.01,
+            force_frame_spike_weight=2.0,
+            # EEF rot6d v2: loss 在 EEF 空间, action target 已是 EEF delta
+            use_eef_loss=False,
+            num_experts=4, num_top_k=1,
+        ),
+        new_module_lr_multiplier=5.0,
+        data=LeRobotPiperDataConfig(
+            repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef_abs",
+            observation_image_key="observation.image",
+            observation_wrist_image_key="observation.wrist_image",
+            default_prompt="perform the task",
+            use_delta_joint_actions=False,
+            use_eef_delta_actions=True,
+            use_force_data=True,
+            predict_force=True,
+            force_in_state=True,
+            use_ft_history=True,
+            ft_history_steps=60,
+            action_dim=10,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_force.Pi0ForceConfig(
+            pi05=True, action_horizon=30, discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        weight_loader=weight_loaders.Pi0ForceWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         log_interval=10,
         save_interval=2000,
         keep_period=10000,
