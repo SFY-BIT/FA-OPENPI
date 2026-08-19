@@ -35,6 +35,29 @@ JOINT_PARAMS = [
 # 默认工具延伸: 夹爪 0.13503 + 传感器 0.076
 DEFAULT_TOOL_EXTENSION = 0.211
 
+# ── 官方 URDF 关节限位 (rad), 与 /mnt/hdd/sfy/Gamepad_PiPER/piper/piper.urdf 一致 ──
+# joint1: [-2.618, 2.618] (±150°)  ― 底座旋转, 最容易被 IK 解过头 (360 vs 180)
+# joint2: [0, 3.14]  (0~180°)       ― 常保持上半平面
+# joint3: [-2.967, 0] (-170°~0)     ― 下半平面
+# joint4: [-1.745, 1.745] (±100°)
+# joint5: [-1.22, 1.22] (±70°)
+# joint6: [-2.967, 2.967] (±170°)
+# ⚠️ 2026-08-19: 无约束数值 IK 会把 q1 解到 165°+/360° (q2/q5 甚至到 -330°/372°),
+#    真机直接转过头撞限位。迭代内必须按此表投影, 否则 serve 时 EEF 模式会乱解。
+JOINT_LIMITS: jax.Array = jnp.array([
+    [-2.618, 2.618],
+    [0.0, 3.14],
+    [-2.967, 0.0],
+    [-1.745, 1.745],
+    [-1.22, 1.22],
+    [-2.967, 2.967],
+], dtype=jnp.float32)
+
+
+def clip_joints(q: jax.Array) -> jax.Array:
+    """把关节角投影回官方 URDF 限位 (逐关节 clip)。"""
+    return jnp.clip(q, JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1])
+
 
 def _rot_x(a: jax.Array) -> jax.Array:
     c, s = jnp.cos(a), jnp.sin(a)
@@ -242,7 +265,9 @@ def eef_ik(
             J = J.at[:3, i].set(jnp.cross(a, p_end - origins[i]))
         # 阻尼最小二乘
         dq = jnp.linalg.solve(J.T @ J + lam * jnp.eye(6), J.T @ err)
-        return q + lr * dq, err, dq
+        # 2026-08-19: 每步把关节clip回官方 URDF 限位 (joint1 ±150° 等)。
+        # 无约束迭代会把 q1 解到 165°+/360°, 真机转过头撞限位。
+        return clip_joints(q + lr * dq), err, dq
 
     def _body(q, _):
         q_new, _, _ = _step(q)
