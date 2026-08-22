@@ -44,6 +44,13 @@ checkpoint 前缀: `/mnt/hdd/sfy/FA-openpi/checkpoints/`
 > 回归时期的 `total_eef/39999`（旧 config `pi05_force_total_task_eef_only_remote`，rot6d 改版前）
 > 已过时，被 408 的 force_eef_chain 取代。
 
+> 训练中（未出最终 ckpt）: **total_task_peel 五线**（peel cucumber 单任务, 41 ep）
+> （sbatch: `job_total_task_peel_r1r2.sbatch`（双joint并行→双EEF并行）+ `job_total_task_peel_r2r3.sbatch`（双EEF resume→dual bs16 串行），
+> 2026-08-22 起，单卡并行，各 bs=8 / dual bs=16，40k 步；
+> config: `pi05_{plain,force}_total_task_peel_{joint,joint_only,eef_v2,eef_joint}_{remote,local}`；
+> 数据集: `total_task_peel_ft60(_noforce)` / `total_task_peel_eef_abs(_noforce)`；
+> 出 ckpt 后登记步数并复制 §2 指令改三处）。
+
 ### 数据集 ↔ 维度速查
 
 | 数据集 | state | action | 用途 |
