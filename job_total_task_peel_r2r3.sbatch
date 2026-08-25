@@ -26,11 +26,12 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 # ============================================================
-# total_task_peel 训练 脚本2: 第三轮 dual（串行独占）
-#   脚本1 已完成 (双joint + 双EEF 均 40k 出 ckpt), 故不需要 resume。
-#   本脚本直接跑 dual bs=16 独占单卡。
+# total_task_peel 训练 脚本2: 第三轮 dual（串行独占, resume 续训）
+#   脚本1 已完成 (双joint + 双EEF 均 40k 出 ckpt), 本脚本只跑 dual。
 #     pi05_force_total_task_peel_eef_joint_remote (force dual, joint 7 维输出 +
 #     EEF 辅 loss warmup 3w; 数据集 ft60)
+#   ★ 2026-08-25: dual 曾在 18.7k 步崩 (CUDA_ERROR_LAUNCH_TIMEOUT, GPU 看门狗),
+#     但 checkpoint 有保存 → 改用 --resume 从上次保存步数续训。
 # 前置: 数据集已在远端; FA-openpi 代码已同步。
 # ============================================================
 
@@ -38,11 +39,11 @@ echo "=== 远端 GPU 信息 ==="
 nvidia-smi
 
 echo "############################################################"
-echo "# [dual] pi05_force_total_task_peel_eef_joint_remote (dual, bs=16, 独占)"
+echo "# [dual] pi05_force_total_task_peel_eef_joint_remote (dual, bs=16, 独占, resume)"
 echo "############################################################"
 python -u scripts/train.py pi05_force_total_task_peel_eef_joint_remote \
     --exp-name=dual_peel \
-    --overwrite \
+    --resume \
     --batch_size=16 \
     --num_train_steps=40000 \
     --save_interval=2000 \
