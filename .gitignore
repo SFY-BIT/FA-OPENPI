@@ -13,6 +13,11 @@ outputs/
 chat.json
 analysis.py
 
+# Offline eval artifacts (huge, regenerable) + ad-hoc debug scripts.
+offline_eval_results/
+test-log/
+tmp_*.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
