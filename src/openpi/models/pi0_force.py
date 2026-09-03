@@ -97,6 +97,15 @@ class Pi0ForceConfig(pi0_config.Pi0Config):
     eef_action_q99: np.ndarray | None = None
     eef_state_q01: np.ndarray | None = None
     eef_state_q99: np.ndarray | None = None
+    # EEF pose normalization stats (dimensionless reprojection). Shapes [9] each:
+    # absolute EEF pose [xyz(3), rot6d(6)] where rot6d = first two rows of R
+    # flattened (row-based, matching the *_eef_abs datasets). Injected by
+    # LeRobotPiperDataConfig from the SAME-source EEF dataset (norm_stats["state"]
+    # first 9 dims). When present, the FK'd EEF pose is reprojected to this
+    # normalized space before computing pos/rot losses so both terms are
+    # dimensionless and comparable (like the joint-space loss).
+    eef_pose_q01: np.ndarray | None = None
+    eef_pose_q99: np.ndarray | None = None
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0Force":
@@ -169,6 +178,10 @@ class Pi0Force(_Pi0):
         self.eef_action_q99 = tuple(np.asarray(config.eef_action_q99, dtype=np.float32)) if config.eef_action_q99 is not None else None
         self.eef_state_q01 = tuple(np.asarray(config.eef_state_q01, dtype=np.float32)) if config.eef_state_q01 is not None else None
         self.eef_state_q99 = tuple(np.asarray(config.eef_state_q99, dtype=np.float32)) if config.eef_state_q99 is not None else None
+        # EEF pose normalization stats for dimensionless reprojection of the
+        # FK'd pose (same storage convention as the joint q01/q99 above).
+        self.eef_pose_q01 = tuple(np.asarray(config.eef_pose_q01, dtype=np.float32)) if config.eef_pose_q01 is not None else None
+        self.eef_pose_q99 = tuple(np.asarray(config.eef_pose_q99, dtype=np.float32)) if config.eef_pose_q99 is not None else None
         # Keep the original config.action_dim (e.g. 32) for state_proj input padding
         # and for the action head (action_in_proj / action_out_proj). The action head
         # ALWAYS operates in the full action_dim space (32), exactly like the base
@@ -489,8 +502,15 @@ class Pi0Force(_Pi0):
             #   q_cur_norm       -> unnorm -> q_cur_real          (current joints)
             #   pred_pose = FK(q_cur_real + pred_delta_real)      (4x4)
             #   gt_pose   = FK(q_cur_real + target_delta_real)    (4x4)
-            #   pos_loss  = ||xyz_pred - xyz_gt||^2
-            #   rot_loss  = ||R_pred @ R_gt^T - I||^2_F  (no wrap, no gimbal)
+            # Then (if eef_pose q01/q99 injected, i.e. dual configs with a
+            # same-source EEF dataset):
+            #   pose = [xyz(3), rot6d(6)] (row-based, matching *_eef_abs data)
+            #   pose_n = 2*(pose - q01)/(q99 - q01) - 1   (dimensionless)
+            #   pos_loss = ||pose_n_pred - pose_n_gt||^2 over xyz
+            #   rot_loss = ||pose_n_pred - pose_n_gt||^2 over rot6d
+            # Fallback (no EEF norm stats injected): physical-space losses
+            #   pos_loss = ||xyz_pred - xyz_gt||^2        (m, dimensional)
+            #   rot_loss = ||R_pred @ R_gt^T - I||^2_F    (no wrap, no gimbal)
             eef_loss = jnp.zeros_like(action_loss)
             eef_pos_loss = jnp.zeros_like(action_loss)
             eef_rot_loss = jnp.zeros_like(action_loss)
@@ -536,15 +556,49 @@ class Pi0Force(_Pi0):
                         -1, actions.shape[-3], 4, 4
                     )
 
-                    # Position loss (m).
-                    pos_diff = T_pred[..., :3, 3] - T_gt[..., :3, 3]
-                    pos_loss = jnp.mean(jnp.sum(pos_diff**2, axis=-1), axis=-1)   # [B]
+                    # Absolute EEF pose in the SAME representation as the
+                    # *_eef_abs datasets: [xyz(3), rot6d(6)] with rot6d = the
+                    # first two rows of R flattened (row-based).
+                    def _pose_from_T(T):
+                        xyz = T[..., :3, 3]                                  # [..., 3]
+                        R = T[..., :3, :3]                                   # [..., 3, 3]
+                        rot6d = R[..., :2, :]                                # [..., 2, 3]
+                        rot6d = rot6d.reshape(rot6d.shape[:-2] + (6,))       # [..., 6]
+                        return jnp.concatenate([xyz, rot6d], axis=-1)        # [..., 9]
 
-                    # Rotation loss: ||R_pred @ R_gt^T - I||_F^2, no wrap/gimbal.
-                    R_pred = T_pred[..., :3, :3]
-                    R_gt = T_gt[..., :3, :3]
-                    R_diff = R_pred @ jnp.swapaxes(R_gt, -1, -2) - jnp.eye(3)
-                    rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
+                    pose_pred = _pose_from_T(T_pred)                         # [B, H, 9]
+                    pose_gt = _pose_from_T(T_gt)                             # [B, H, 9]
+                    if (
+                        self.eef_pose_q01 is not None
+                        and self.eef_pose_q99 is not None
+                    ):
+                        # Reproject the absolute EEF pose into the dimensionless
+                        # normalized space of the same-source EEF dataset:
+                        #   norm = 2*(real - q01)/(q99 - q01) - 1
+                        # Both pos and rot become unitless & comparable (like the
+                        # joint-space loss), so the small (m^2) position term is
+                        # no longer drowned out.
+                        p_q01 = jnp.asarray(self.eef_pose_q01)               # [9]
+                        p_q99 = jnp.asarray(self.eef_pose_q99)
+                        pose_pred_n = 2.0 * (pose_pred - p_q01) / (p_q99 - p_q01) - 1.0
+                        pose_gt_n = 2.0 * (pose_gt - p_q01) / (p_q99 - p_q01) - 1.0
+                        pose_diff = pose_pred_n - pose_gt_n                   # [B, H, 9]
+                        pos_loss = jnp.mean(
+                            jnp.sum(pose_diff[..., :3] ** 2, axis=-1), axis=-1
+                        )                                                     # [B]
+                        rot_loss = jnp.mean(
+                            jnp.sum(pose_diff[..., 3:] ** 2, axis=-1), axis=-1
+                        )                                                     # [B]
+                    else:
+                        # Fallback (legacy): physical-space losses. Position in
+                        # meters (dimensional), rotation via Frobenius on R.
+                        pos_diff = T_pred[..., :3, 3] - T_gt[..., :3, 3]
+                        pos_loss = jnp.mean(jnp.sum(pos_diff**2, axis=-1), axis=-1)   # [B]
+
+                        R_pred = T_pred[..., :3, :3]
+                        R_gt = T_gt[..., :3, :3]
+                        R_diff = R_pred @ jnp.swapaxes(R_gt, -1, -2) - jnp.eye(3)
+                        rot_loss = jnp.mean(jnp.sum(R_diff**2, axis=(-2, -1)), axis=-1)  # [B]
 
                     eef_loss = self.eef_pos_weight * pos_loss + self.eef_angle_weight * rot_loss
                     # In eef_only_mode, use UNWEIGHTED EEF loss (pos+rot each 1.0)

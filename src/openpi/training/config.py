@@ -410,6 +410,12 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     # gripper (single-arm Piper/Panda).  Set to 14 for dual-arm ARX X5
     # (7 + 7 joints, no gripper).
     action_dim: int = 8
+    # Same-source EEF dataset (repo_id / absolute path) whose recordings are the
+    # SAME trajectories as this joint dataset (joint↔EEF are the same captures).
+    # Its norm_stats["state"] (absolute EEF pose [xyz(3), rot6d(6)]) provides the
+    # q01/q99 range used to reproject the FK'd EEF pose to a dimensionless space
+    # for the EEF pose loss (dual training). Only used when use_eef_loss=True.
+    eef_repo_id: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -567,6 +573,35 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                 eef_state_q99=st_q99,
             )
             logging.info("EEF loss: injected action/state quantile norm stats (q01/q99)")
+
+        # EEF pose loss (dimensionless reprojection): the joint↔EEF datasets are
+        # the SAME recordings, so the absolute EEF pose reached by FK matches the
+        # EEF dataset state. Load the same-source EEF dataset norm_stats["state"]
+        # and inject its first 9 dims [xyz(3), rot6d(6)] as the normalization
+        # range used by compute_loss to reproject the FK'd pose (q01/q99 → [-1,1]).
+        if getattr(model_config, "use_eef_loss", False) and self.eef_repo_id:
+            eef_norm_stats = self._load_norm_stats(
+                epath.Path(self.assets.assets_dir or assets_dirs), self.eef_repo_id
+            )
+            if eef_norm_stats is not None and "state" in eef_norm_stats:
+                es = eef_norm_stats["state"]
+                eef_pose_q01 = np.asarray(es.q01)[:9].astype(np.float32)
+                eef_pose_q99 = np.asarray(es.q99)[:9].astype(np.float32)
+                model_config = dataclasses.replace(
+                    model_config,
+                    eef_pose_q01=eef_pose_q01,
+                    eef_pose_q99=eef_pose_q99,
+                )
+                logging.info(
+                    "EEF loss: injected EEF pose normalization stats (q01/q99, %s)",
+                    self.eef_repo_id,
+                )
+            else:
+                logging.warning(
+                    "EEF loss: eef_repo_id=%s norm_stats missing \"state\" "
+                    "— falling back to physical-space EEF loss",
+                    self.eef_repo_id,
+                )
 
         action_sequence_keys = [self.action_key]
         if self.predict_force:
@@ -2817,6 +2852,7 @@ _CONFIGS = [
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
             repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_ft60",
+            eef_repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef_abs",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -3019,6 +3055,7 @@ _CONFIGS = [
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
             repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_ft60",
+            eef_repo_id="/mnt/hdd/sfy/datasets/total_2task_flexiv_eef_abs",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -3219,6 +3256,7 @@ _CONFIGS = [
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
             repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_ft60",
+            eef_repo_id="/data/group1/junjie008/datasets/total_2task_flexiv_eef_abs",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="perform the task",
@@ -3951,6 +3989,7 @@ _CONFIGS = [
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
             repo_id="/data/group1/junjie008/datasets/total_task_peel_ft60",
+            eef_repo_id="/data/group1/junjie008/datasets/total_task_peel_eef_abs",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="peel cucumber",
@@ -4018,6 +4057,7 @@ _CONFIGS = [
         new_module_lr_multiplier=5.0,
         data=LeRobotPiperDataConfig(
             repo_id="/mnt/hdd/sfy/datasets/total_task_peel_ft60",
+            eef_repo_id="/mnt/hdd/sfy/datasets/total_task_peel_eef_abs",
             observation_image_key="observation.image",
             observation_wrist_image_key="observation.wrist_image",
             default_prompt="peel cucumber",
