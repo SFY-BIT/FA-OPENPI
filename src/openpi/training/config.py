@@ -3516,6 +3516,7 @@ _CONFIGS = [
             action_loss_weight=0.9,
             force_loss_weight=0.01,
             force_frame_spike_weight=2.0,
+            force_head_loss_weight=0.01,
             # EEF rot6d v2: loss 在 EEF 空间, action target 已是 EEF delta
             use_eef_loss=False,
             num_experts=4, num_top_k=1,
@@ -3856,6 +3857,7 @@ _CONFIGS = [
             action_loss_weight=0.9,
             force_loss_weight=0.01,
             force_frame_spike_weight=2.0,
+            force_head_loss_weight=0.01,
             use_eef_loss=False,
             num_experts=4, num_top_k=1,
         ),
@@ -3916,6 +3918,7 @@ _CONFIGS = [
             action_loss_weight=0.9,
             force_loss_weight=0.01,
             force_frame_spike_weight=2.0,
+            force_head_loss_weight=0.01,
             use_eef_loss=False,
             num_experts=4, num_top_k=1,
         ),
